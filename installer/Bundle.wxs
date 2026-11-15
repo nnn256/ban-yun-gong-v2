@@ -2,10 +2,10 @@
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
   <Bundle Name="搬运工V2 安装程序"
           Manufacturer="搬运工V2"
-          Version="2.0.1.0"
+          Version="2.0.2.0"
           UpgradeCode="{A89BA89A-4CBD-459B-854D-C4678E22E850}"
           Compressed="yes">
-    <Variable Name="InstallFolder" Type="formatted" Value="D:\搬运工V2" bal:Overridable="yes" />
+    <Variable Name="InstallFolder" Type="formatted" Value="[LocalAppDataFolder]Programs\搬运工V2" bal:Overridable="yes" />
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
                                                LicenseUrl=""

@@ -1,0 +1,44 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="搬运工V2"
+           Manufacturer="搬运工V2"
+           Version="2.0.0"
+           UpgradeCode="{D5231F74-AE3B-4A53-8C40-1D742FA9A391}"
+           Scope="perUser">
+    <SummaryInformation Description="QQ 与飞书本地消息转发工作台" Manufacturer="搬运工V2" />
+    <MajorUpgrade DowngradeErrorMessage="已安装较新版本的搬运工V2。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="INSTALLFOLDER" Value="D:\搬运工V2" Secure="yes" />
+    <StandardDirectory Id="PerUserProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="搬运工V2" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppStartMenuFolder" Name="搬运工V2">
+        <Component Id="StartMenuShortcut" Guid="{D7CDB2A0-B765-42D9-AC8A-566BF797A45B}">
+          <Shortcut Id="StartWorkbenchShortcut"
+                    Name="启动搬运工V2工作台"
+                    Description="启动本地消息转发工作台"
+                    Target="[INSTALLFOLDER]launch-workbench.cmd"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\搬运工V2" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="{F75E89FC-B5AD-43D4-B060-9DCE1719779D}">
+        <Shortcut Id="DesktopWorkbenchShortcut"
+                  Name="搬运工V2工作台"
+                  Description="启动本地消息转发工作台"
+                  Target="[INSTALLFOLDER]launch-workbench.cmd"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\搬运工V2" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+    <Feature Id="MainFeature" Title="搬运工V2" Level="1">
+      <ComponentGroupRef Id="PayloadFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,68 @@
+<WixLocalization Culture="zh-CN" Language="2052" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="Caption" Value="[WixBundleName] 安装程序" />
+  <String Id="Title" Value="[WixBundleName]" />
+  <String Id="CheckingForUpdatesLabel" Value="正在检查更新" />
+  <String Id="UpdateButton" Value="更新到版本 [WixStdBAUpdateAvailable]" />
+  <String Id="InstallHeader" Value="欢迎使用搬运工V2" />
+  <String Id="InstallMessage" Value="安装程序将在电脑上安装搬运工V2。单击“安装”继续，或单击“取消”退出。首次启动需要联网下载运行环境。" />
+  <String Id="InstallMessageOptions" Value="安装程序将在电脑上安装搬运工V2。可在“选项”中修改安装位置。首次启动需要联网下载运行环境。" />
+  <String Id="InstallVersion" Value="版本 [WixBundleVersion]" />
+  <String Id="ConfirmCancelMessage" Value="确定要取消安装吗？" />
+  <String Id="ExecuteUpgradeRelatedBundleMessage" Value="检测到旧版本" />
+  <String Id="HelpHeader" Value="安装帮助" />
+  <String Id="HelpText" Value="/install：安装；/repair：修复；/uninstall：卸载；/layout [目录]：解压安装文件。&#xA;&#xA;/passive：最少提示安装；/quiet：静默安装。&#xA;/norestart：不自动重启；/log 日志路径：指定安装日志。" />
+  <String Id="HelpCloseButton" Value="关闭" />
+  <String Id="InstallLicenseLinkText" Value="搬运工V2 使用条款" />
+  <String Id="InstallAcceptCheckbox" Value="我同意使用条款" />
+  <String Id="InstallOptionsButton" Value="选项" />
+  <String Id="InstallInstallButton" Value="安装" />
+  <String Id="InstallCancelButton" Value="取消" />
+  <String Id="OptionsHeader" Value="安装选项" />
+  <String Id="OptionsLocationLabel" Value="安装位置：" />
+  <String Id="OptionsPerUserScopeText" Value="仅为我安装搬运工V2" />
+  <String Id="OptionsPerMachineScopeText" Value="为这台电脑的所有用户安装搬运工V2" />
+  <String Id="OptionsBrowseButton" Value="浏览…" />
+  <String Id="OptionsOkButton" Value="确定" />
+  <String Id="OptionsCancelButton" Value="取消" />
+  <String Id="ProgressHeader" Value="安装进度" />
+  <String Id="ProgressLabel" Value="正在处理：" />
+  <String Id="OverallProgressPackageText" Value="正在准备…" />
+  <String Id="ProgressCancelButton" Value="取消" />
+  <String Id="ModifyHeader" Value="修改安装" />
+  <String Id="ModifyRepairButton" Value="修复" />
+  <String Id="ModifyUninstallButton" Value="卸载" />
+  <String Id="ModifyCancelButton" Value="取消" />
+  <String Id="SuccessHeader" Value="安装成功" />
+  <String Id="SuccessCacheHeader" Value="安装文件已准备完成" />
+  <String Id="SuccessInstallHeader" Value="搬运工V2已安装完成" />
+  <String Id="SuccessLayoutHeader" Value="文件解压完成" />
+  <String Id="SuccessModifyHeader" Value="修改完成" />
+  <String Id="SuccessRepairHeader" Value="修复完成" />
+  <String Id="SuccessUninstallHeader" Value="卸载完成" />
+  <String Id="SuccessUnsafeUninstallHeader" Value="卸载完成" />
+  <String Id="SuccessLaunchButton" Value="启动工作台" />
+  <String Id="SuccessRestartText" Value="使用软件前需要重新启动电脑。" />
+  <String Id="SuccessUninstallRestartText" Value="完成卸载需要重新启动电脑。" />
+  <String Id="SuccessRestartButton" Value="重新启动" />
+  <String Id="SuccessCloseButton" Value="关闭" />
+  <String Id="FailureHeader" Value="安装失败" />
+  <String Id="FailureCacheHeader" Value="准备安装文件失败" />
+  <String Id="FailureInstallHeader" Value="安装失败" />
+  <String Id="FailureLayoutHeader" Value="解压失败" />
+  <String Id="FailureModifyHeader" Value="修改失败" />
+  <String Id="FailureRepairHeader" Value="修复失败" />
+  <String Id="FailureUninstallHeader" Value="卸载失败" />
+  <String Id="FailureUnsafeUninstallHeader" Value="卸载失败" />
+  <String Id="FailureHyperlinkLogText" Value="安装未能完成。请查看&lt;a href=&quot;#&quot;&gt;安装日志&lt;/a&gt;，然后重试。" />
+  <String Id="FailureRestartText" Value="回滚安装需要重新启动电脑。" />
+  <String Id="FailureRestartButton" Value="重新启动" />
+  <String Id="FailureCloseButton" Value="关闭" />
+  <String Id="FilesInUseTitle" Value="文件正在使用" />
+  <String Id="FilesInUseLabel" Value="以下程序正在使用需要更新的文件：" />
+  <String Id="FilesInUseNetfxCloseRadioButton" Value="关闭这些程序" />
+  <String Id="FilesInUseCloseRadioButton" Value="关闭这些程序并尝试重新启动" />
+  <String Id="FilesInUseDontCloseRadioButton" Value="不要关闭程序，需要重新启动电脑" />
+  <String Id="FilesInUseRetryButton" Value="重试" />
+  <String Id="FilesInUseIgnoreButton" Value="忽略" />
+  <String Id="FilesInUseExitButton" Value="退出" />
+</WixLocalization>

@@ -1,0 +1,14 @@
+runtime/
+data/
+artifacts/
+tools/*.exe
+__pycache__/
+**/__pycache__/
+*.py[cod]
+workbench.settings.json
+bridge-status.json
+credentials.json
+cmd_config.json
+onebot.json
+bridge_rules.json
+*.dpapi

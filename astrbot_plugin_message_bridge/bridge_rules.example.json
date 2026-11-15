@@ -1,0 +1,8 @@
+{
+  "managed_platforms": [
+    "aiocqhttp",
+    "larkx"
+  ],
+  "bridge_enabled": true,
+  "rules": []
+}

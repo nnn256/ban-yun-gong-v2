@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-CN" data-workbench-ui="20261116-group-name-13">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f4f6f4">
+    <title>搬运工V2 工作台</title>
+    <link rel="stylesheet" href="/assets/style.css?v=20261116-group-name-13">
+    <script defer src="/assets/app.js?v=20261116-group-name-13"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <a class="brand" href="#overview" aria-label="搬运工 V2 工作台">
+          <span class="brand-mark" aria-hidden="true"><i></i><b></b></span>
+          <span class="brand-copy"><strong>搬运工</strong><small>LOCAL BRIDGE · V2</small></span>
+        </a>
+        <div class="workspace-label">工作空间</div>
+        <nav class="primary-nav">
+          <button class="nav-item active" data-page="overview" aria-current="page" aria-label="运行总览" title="运行总览">
+            <span class="nav-glyph glyph-overview" aria-hidden="true"></span><span>运行总览</span>
+          </button>
+          <button class="nav-item" data-page="setup" aria-label="接入向导" title="接入向导">
+            <span class="nav-glyph glyph-setup" aria-hidden="true"></span><span>接入向导</span>
+          </button>
+          <button class="nav-item" data-page="rules" aria-label="群映射" title="群映射">
+            <span class="nav-glyph glyph-rules" aria-hidden="true"></span><span>群映射</span><span id="navRuleCount" class="nav-count">0</span>
+          </button>
+          <button class="nav-item" data-page="settings" aria-label="本地设置" title="本地设置">
+            <span class="nav-glyph glyph-settings" aria-hidden="true"></span><span>本地设置</span>
+          </button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="local-dot"></span>
+          <div><strong>仅本机访问</strong><small>127.0.0.1</small></div>
+        </div>
+      </aside>
+
+      <div class="main-column">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>搬运工V2</span><span class="crumb-slash">/</span><strong id="currentPageLabel">运行总览</strong></div>
+          <div class="topbar-actions">
+            <span id="astrbotStatus" class="status-pill status-muted"><i></i><span>AstrBot 检查中</span></span>
+            <button id="bridgeToggle" class="button button-outline bridge-toggle" type="button" aria-pressed="true" disabled>读取转发状态…</button>
+            <a id="openAstrbot" class="button button-quiet" href="http://127.0.0.1:6185/" target="_blank" rel="noreferrer" aria-disabled="true">打开 AstrBot <span aria-hidden="true">↗</span></a>
+            <button id="topStart" class="button button-primary" type="button">启动 AstrBot</button>
+          </div>
+        </header>
+
+        <main>
+          <section class="view active" id="page-overview" aria-labelledby="overviewTitle">
+            <div class="page-heading">
+              <div>
+                <p class="eyebrow">LOCAL MESSAGE ROUTING</p>
+                <h1 id="overviewTitle">运行总览</h1>
+                <p class="page-subtitle">查看连接状态，管理 QQ、飞书及同平台会话之间的转发。</p>
+              </div>
+              <button class="button button-primary" type="button" data-open-mapping>新增群映射 <span aria-hidden="true">+</span></button>
+            </div>
+
+            <section class="runtime-banner" aria-labelledby="runtimeTitle">
+              <div class="runtime-symbol" aria-hidden="true"><span></span><span></span></div>
+              <div class="runtime-copy">
+                <div class="runtime-title-line"><h2 id="runtimeTitle">AstrBot 本地实例</h2><span id="runtimeTag" class="mini-tag tag-neutral">未启动</span></div>
+                <p id="runtimeDetail">服务就绪后，桥接插件会拦截 QQ / 飞书事件并按群映射转发。</p>
+                <code id="runtimePath">D:\搬运工V2\runtime\AstrBot</code>
+              </div>
+              <div class="runtime-actions">
+                <button id="installPlugin" class="button button-outline" type="button">安装桥接插件</button>
+                <button id="runtimeStart" class="button button-primary" type="button">启动 AstrBot</button>
+                <button id="runtimeStop" class="button button-danger-quiet" type="button" disabled>停止</button>
+              </div>
+            </section>
+
+            <section class="connection-section" aria-labelledby="connectionsTitle">
+              <div class="section-heading">
+                <div><p class="eyebrow">ADAPTERS</p><h2 id="connectionsTitle">平台连接</h2></div>
+                <span class="section-note">连接由 AstrBot 与平台适配器管理</span>
+              </div>
+              <div class="connection-list">
+                <div class="connection-row">
+                  <div class="platform-brand qq-brand">Q</div>
+                  <div class="connection-name"><strong>QQ · SnowLuma Go</strong><small id="qqAccountSummary">QQ 账号与 OneBot 状态分别检查</small><div id="qqAccountsList" class="qq-accounts-list" aria-live="polite"></div><small id="qqForwardActivity" class="connection-activity">等待消息活动</small><div class="connection-local-links"><a id="openSnowLumaLocal" class="text-link" href="http://127.0.0.1:5100/" target="_blank" rel="noreferrer" aria-disabled="true">SnowLuma 本机页面 ↗</a><code id="qqOneBotAddress">ws://127.0.0.1:6199/ws</code></div></div>
+                  <div class="connection-state"><i id="qqDot" class="state-dot"></i><span id="qqState">待启动</span></div>
+                  <div class="connection-meta"><span>QQ 账号</span><span id="qqIdentityState">未确认</span></div>
+                  <div class="connection-actions"><button id="launchLocalQq" class="button button-primary button-small" type="button">打开本机 QQ 扫码</button><a id="openSnowLumaExtension" class="button button-quiet button-small" href="http://127.0.0.1:6185/#/extension/plugins" target="_blank" rel="noreferrer">打开扩展 <span aria-hidden="true">↗</span></a></div>
+                </div>
+                <div class="connection-row">
+                  <div class="platform-brand feishu-brand">飞</div>
+                  <div class="connection-name"><strong>飞书个人账号</strong><small id="feishuAuth">LarkAgentX · 本地消息连接</small></div>
+                  <div class="connection-state"><i id="feishuDot" class="state-dot"></i><span id="feishuState">待配置</span></div>
+                  <div class="connection-meta"><span>本机</span><span id="feishuDesktopState">检查中</span></div>
+                  <a class="text-link" href="https://github.com/cv-cat/LarkAgentX" target="_blank" rel="noreferrer">LarkAgentX <span aria-hidden="true">↗</span></a>
+                </div>
+              </div>
+              <p class="connection-footnote"><span class="note-mark">i</span><span id="feishuMonitorActivity">飞书实时监听等待状态检查。LarkAgentX 使用本地个人账号会话，agent backend 固定为 none。</span></p>
+            </section>
+
+            <section class="mapping-section" aria-labelledby="mappingOverviewTitle">
+              <div class="section-heading">
+                <div><p class="eyebrow">ACTIVE ROUTES</p><h2 id="mappingOverviewTitle">群映射</h2></div>
+                <div class="section-actions"><span id="enabledRouteSummary" class="section-note">0 条启用</span><button class="button button-quiet button-small" data-page-link="rules" type="button">查看全部 <span aria-hidden="true">→</span></button></div>
+              </div>
+              <div id="overviewRoutes" class="route-list"></div>
+            </section>
+
+            <div class="lower-grid">
+              <section class="log-section" aria-labelledby="logTitle">
+                <div class="section-heading compact-heading">
+                  <div><p class="eyebrow">LATEST ACTIVITY</p><h2 id="logTitle">运行日志</h2></div>
+                  <button id="refreshButton" class="icon-button" type="button" title="刷新状态" aria-label="刷新状态"><span aria-hidden="true">↻</span></button>
+                </div>
+                <div id="logList" class="log-list"><p class="empty-inline">AstrBot 启动后会在这里显示最近日志。</p></div>
+              </section>
+              <section class="guardrail-section" aria-labelledby="guardrailTitle">
+                <div class="guardrail-icon" aria-hidden="true">✓</div>
+              <div><p class="eyebrow">RUNTIME MODE</p><h2 id="guardrailTitle">LarkAgentX 不启动 coding agent</h2><p>LarkAgentX agent backend 固定为 none。消息映射独立转发；AstrBot 是否生成回复由其模型与机器人设置决定。</p></div>
+              </section>
+            </div>
+
+            <section id="bootstrapNotice" class="bootstrap-notice" hidden aria-labelledby="bootstrapTitle">
+              <div class="bootstrap-heading"><div><p class="eyebrow">LOCAL ADMIN</p><h2 id="bootstrapTitle">AstrBot 管理登录</h2></div><span class="mini-tag tag-warning">Windows DPAPI 加密</span></div>
+              <p class="bootstrap-help">登录后按 AstrBot 提示更改密码。修改完成后，把新密码粘贴到此处并保存；工作台只保留当前 Windows 用户可解密的本机副本。</p>
+              <div class="bootstrap-fields">
+                <label>用户名<input id="bootstrapUsername" readonly value="astrbot"></label>
+                <label>登录密码<div class="password-control"><input id="bootstrapPassword" type="password"><button id="toggleBootstrapPassword" type="button" class="icon-button" aria-label="显示登录密码" title="显示登录密码">◉</button><button id="copyBootstrapPassword" type="button" class="button button-quiet button-small">复制</button></div></label>
+              </div>
+              <div class="bootstrap-actions"><button id="saveBootstrapPassword" type="button" class="button button-outline button-small">保存新密码</button><button id="clearBootstrapPassword" type="button" class="text-link">清除本机副本</button></div>
+            </section>
+          </section>
+
+          <section class="view" id="page-setup" aria-labelledby="setupTitle" hidden>
+            <div class="page-heading">
+              <div><p class="eyebrow">CONNECTION WIZARD</p><h1 id="setupTitle">接入向导</h1><p class="page-subtitle">按顺序完成平台接入，再添加群映射。</p></div>
+            </div>
+            <div class="setup-progress-line"><span id="setupProgress">0 / 4 已完成</span><span>配置保存在 AstrBot 本地目录</span></div>
+            <ol class="setup-step-list">
+              <li class="setup-step-row" id="wizardRuntime">
+                <span class="setup-step-number">01</span>
+                <div class="setup-step-main"><div class="setup-step-title"><h2>AstrBot 与桥接插件</h2><span id="wizardRuntimeState" class="mini-tag tag-neutral">检查中</span></div><p>工作台启动 AstrBot，桥接插件已安装。登录 AstrBot 管理页可管理平台适配器。</p><code>http://127.0.0.1:6185/</code></div>
+                <a class="button button-quiet button-small" href="http://127.0.0.1:6185/" target="_blank" rel="noreferrer">打开 AstrBot ↗</a>
+              </li>
+              <li class="setup-step-row" id="wizardQqStep">
+                <span class="setup-step-number">02</span>
+                <div class="setup-step-main"><div class="setup-step-title"><h2>QQ · Snowluma Go 扩展</h2><span id="wizardQqState" class="mini-tag tag-neutral">等待扩展部署</span></div><p>AstrBot 已配置 OneBot v11，端口 6199，Access Token 留空。进入 Snowluma Go 页面，按“部署步骤”安装并启动 Windows SnowLuma，登录/挂载 QQ，再同步 OneBot 连接。</p><p class="setup-step-note">SnowLuma WebUI 管理密码可在扩展状态卡查看。协议确认由你在扩展页面操作；扩展默认不自动同意。</p></div>
+                <div class="setup-step-actions"><a id="openSnowLumaExtensionWizard" class="button button-primary button-small" href="http://127.0.0.1:6185/#/extension/plugins" target="_blank" rel="noreferrer">打开 AstrBot 扩展 ↗</a></div>
+              </li>
+              <li class="setup-step-row" id="wizardFeishuStep">
+                <span class="setup-step-number">03</span>
+                <div class="setup-step-main"><div class="setup-step-title"><h2>飞书个人账号 · LarkAgentX</h2><span id="wizardFeishuState" class="mini-tag tag-warning">等待扫码</span></div><p>使用飞书 App 扫码登录。会话凭证保存到本机 `runtime\LarkAgentX-data`；agent backend 固定为 <code>none</code>，不调用 Claude/Codex。</p><p class="setup-step-note">该项目使用飞书网页版内部协议，非飞书官方机器人接口；登录凭证仅保存在本机。请使用你愿意用于该接入方式的账号。</p><div id="larkxQrPanel" class="larkx-qr-panel" hidden><img id="larkxQrImage" alt="飞书扫码登录二维码"><div><strong id="larkxQrStatus">等待扫码</strong><p id="larkxQrMessage">使用飞书 App 扫描二维码并在手机上确认。</p><span id="larkxQrCountdown"></span></div></div></div>
+                <div class="setup-step-actions"><button id="startLarkXQr" class="button button-primary button-small" type="button">生成登录二维码</button></div>
+              </li>
+              <li class="setup-step-row" id="wizardMappingStep">
+                <span class="setup-step-number">04</span>
+                <div class="setup-step-main"><div class="setup-step-title"><h2>群映射</h2><span id="wizardMappingState" class="mini-tag tag-neutral">未设置</span></div><p>在飞书会话先发一条消息，工作台会自动记录可选会话 ID；再选择 QQ 群和飞书会话建立双向映射。</p></div>
+                <button class="button button-primary button-small" data-page-link="rules" type="button">管理映射 →</button>
+              </li>
+            </ol>
+            <div class="setup-constraint"><span class="note-mark">i</span><p><strong>纯规则转发</strong><br>LarkAgentX agent backend 固定为 none；桥接插件会截住接管的平台事件，不触发 AstrBot AI 回复。</p></div>
+          </section>
+
+          <section class="view" id="page-rules" aria-labelledby="rulesTitle" hidden>
+            <div class="page-heading">
+              <div><p class="eyebrow">ROUTING TABLE</p><h1 id="rulesTitle">群映射</h1><p class="page-subtitle">QQ 和飞书两侧自由搭配；群聊、私聊均可设置。双向映射建立两条独立规则。</p></div>
+              <button class="button button-primary" type="button" data-open-mapping>新增群映射 <span aria-hidden="true">+</span></button>
+            </div>
+            <div class="rules-toolbar">
+              <div class="filter-tabs" role="group" aria-label="映射过滤">
+                <button class="filter-tab active" data-filter="all" type="button">全部 <span id="allCount">0</span></button>
+                <button class="filter-tab" data-filter="enabled" type="button">启用 <span id="enabledCount">0</span></button>
+                <button class="filter-tab" data-filter="disabled" type="button">停用 <span id="disabledCount">0</span></button>
+              </div>
+              <button id="saveRules" class="button button-outline" type="button">保存映射</button>
+            </div>
+            <div id="rulesTable" class="rules-table-wrap"></div>
+            <p class="rules-hint">修改后选择“保存映射”。已运行的桥接插件会热更新映射，无需重载插件或重启 AstrBot。</p>
+          </section>
+
+          <section class="view" id="page-settings" aria-labelledby="settingsTitle" hidden>
+            <div class="page-heading">
+              <div><p class="eyebrow">LOCAL INSTANCE</p><h1 id="settingsTitle">本地设置</h1><p class="page-subtitle">工作台与 AstrBot 的本机目录和管理端口。</p></div>
+            </div>
+            <section class="settings-section">
+              <div class="section-heading"><div><p class="eyebrow">ASTRBOT</p><h2>运行实例</h2></div><span class="mini-tag tag-neutral">本地安装 · v4.29.4</span></div>
+              <form id="settingsForm" class="settings-form">
+                <label class="field-label" for="astrbotRoot">AstrBot 根目录</label>
+                <input id="astrbotRoot" name="astrbot_root" type="text" spellcheck="false" autocomplete="off" required>
+                <p class="field-help">应包含 .astrbot 标记文件和 data\plugins 目录。</p>
+                <label class="field-label" for="astrbotPort">WebUI 端口</label>
+                <div class="port-control"><input id="astrbotPort" name="astrbot_port" type="number" min="1024" max="65535" required><span>仅绑定 127.0.0.1</span></div>
+                <div class="form-actions"><button class="button button-primary" type="submit">保存设置</button><button id="installPluginSettings" class="button button-outline" type="button">安装 / 修复插件</button></div>
+              </form>
+            </section>
+            <section class="settings-section integration-info">
+              <div class="section-heading"><div><p class="eyebrow">SECURITY & AI</p><h2>工作边界</h2></div></div>
+              <div class="info-rows">
+                <div><span>工作台监听</span><strong>127.0.0.1 · 本机访问</strong></div>
+                <div><span>飞书账号</span><strong>LarkAgentX 扫码凭证保存在本机 runtime 数据目录</strong></div>
+                <div><span>AI Agent</span><strong>LarkAgentX 固定 none，不启动 Claude/Codex</strong></div>
+                <div><span>配置文件</span><code id="configPath">等待 AstrBot 目录</code></div>
+              </div>
+            </section>
+          </section>
+
+          <footer class="page-footer"><span>搬运工V2 · 本机消息桥接</span><span id="lastUpdated">状态尚未读取</span></footer>
+        </main>
+      </div>
+    </div>
+
+    <dialog id="mappingDialog" class="mapping-dialog">
+      <form id="mappingForm" method="dialog">
+        <div class="dialog-heading"><div><p class="eyebrow">NEW ROUTE</p><h2>新增群映射</h2></div><button id="closeDialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
+        <p class="dialog-intro">来源和目标独立选择 QQ 或飞书，支持 QQ → QQ、飞书 → 飞书及跨平台。选择双向会建立两条独立规则。</p>
+        <div class="mapping-discovery-toolbar"><div><strong>自动读取账号与群列表</strong><p id="mappingDiscoveryStatus" role="status">打开时将读取当前账号可验证的群与已观察会话。</p></div><button id="refreshMappingDiscovery" class="button button-outline button-small" type="button">自动读取</button></div>
+        <div class="pair-grid">
+          <fieldset>
+            <legend>来源</legend>
+            <label for="sourcePlatform">平台</label><select id="sourcePlatform"><option value="aiocqhttp">QQ / OneBot</option><option value="larkx">飞书个人账号</option></select>
+            <label for="sourceInstance">平台实例 / 登录 ID</label><input id="sourceInstance" list="sourceInstanceOptions" required autocomplete="off"><datalist id="sourceInstanceOptions"></datalist>
+            <label id="sourceAccountLabel" for="sourceAccount">本机 QQ 账号</label><select id="sourceAccount"><option value="">先读取账号，再选择 QQ</option></select><p id="sourceAccountHelp" class="field-help"></p>
+            <label for="sourceMessageType">聊天类型</label><select id="sourceMessageType"><option value="GroupMessage">群聊</option><option value="FriendMessage">私聊</option></select>
+            <label for="sourceSessionSearch">按群名查找会话</label><input id="sourceSessionSearch" type="search" autocomplete="off" placeholder="搜索群名；也可输入群 ID"><select id="sourceSessionPicker" aria-label="来源会话名称"><option value="">读取后按群名选择</option></select>
+            <label id="sourceSessionLabel" for="sourceSession">群 / 会话 ID（自动填入，可编辑）</label><input id="sourceSession" required autocomplete="off" placeholder="选择上方群名后自动填入，也可手动填写"><p id="sourceSessionHelp" class="field-help"></p>
+          </fieldset>
+          <div class="pair-divider" aria-hidden="true"><span>↔</span></div>
+          <fieldset>
+            <legend>目标</legend>
+            <label for="targetPlatform">平台</label><select id="targetPlatform"><option value="larkx">飞书个人账号</option><option value="aiocqhttp">QQ / OneBot</option></select>
+            <label for="targetInstance">平台实例 / 登录 ID</label><input id="targetInstance" list="targetInstanceOptions" required autocomplete="off"><datalist id="targetInstanceOptions"></datalist>
+            <label id="targetAccountLabel" for="targetAccount">本机 QQ 账号</label><select id="targetAccount"><option value="">先读取账号，再选择 QQ</option></select><p id="targetAccountHelp" class="field-help"></p>
+            <label for="targetMessageType">聊天类型</label><select id="targetMessageType"><option value="GroupMessage">群聊</option><option value="FriendMessage">私聊</option></select>
+            <label for="targetSessionSearch">按群名查找会话</label><input id="targetSessionSearch" type="search" autocomplete="off" placeholder="搜索群名；也可输入群 ID"><select id="targetSessionPicker" aria-label="目标会话名称"><option value="">读取后按群名选择</option></select>
+            <label id="targetSessionLabel" for="targetSession">群 / 会话 ID（自动填入，可编辑）</label><input id="targetSession" required autocomplete="off" placeholder="选择上方群名后自动填入，也可手动填写"><p id="targetSessionHelp" class="field-help"></p>
+          </fieldset>
+        </div>
+        <p id="mappingDiscoveryWarnings" class="mapping-discovery-warnings" hidden></p>
+        <label class="field-label" for="mappingDirection">转发方向</label>
+        <select id="mappingDirection"><option value="both">双向</option><option value="forward">单向：来源 → 目标</option></select>
+        <label class="include-self-option"><input id="mappingIncludeSelf" type="checkbox">转发本人手动发送的消息（默认关闭）</label>
+        <p class="field-help">桥接自己发出的消息回声始终过滤，避免循环。</p>
+        <div id="dialogError" class="inline-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button id="cancelDialog" class="button button-quiet" type="button">取消</button><button class="button button-primary" type="submit">创建映射</button></div>
+      </form>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

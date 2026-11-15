@@ -1,0 +1,23 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="搬运工V2 安装程序"
+          Manufacturer="搬运工V2"
+          Version="2.0.0.0"
+          UpgradeCode="{A89BA89A-4CBD-459B-854D-C4678E22E850}"
+          Compressed="yes">
+    <Variable Name="InstallFolder" Type="formatted" Value="D:\搬运工V2" bal:Overridable="yes" />
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+                                               LicenseUrl=""
+                                               LocalizationFile="$(var.InstallerSource)\zh-CN.wxl"
+                                               ShowVersion="yes"
+                                               LaunchTarget="[InstallFolder]launch-workbench.cmd"
+                                               LaunchWorkingFolder="[InstallFolder]" />
+    </BootstrapperApplication>
+    <Chain>
+      <MsiPackage SourceFile="$(var.MsiPath)" Vital="yes">
+        <MsiProperty Name="INSTALLFOLDER" Value="[InstallFolder]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

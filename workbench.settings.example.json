@@ -1,0 +1,4 @@
+{
+  "astrbot_root": "./runtime/AstrBot",
+  "astrbot_port": 6185
+}

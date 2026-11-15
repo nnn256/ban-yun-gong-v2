@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputExe = (Join-Path $PSScriptRoot 'artifacts/portable/搬运工V2.exe'),
     [string]$UvOutput = (Join-Path $PSScriptRoot 'artifacts/portable/tools/uv.exe')
 )

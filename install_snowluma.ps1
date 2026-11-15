@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $runtimeDir = Join-Path $PSScriptRoot 'runtime\SnowLuma'
 $archive = Join-Path $runtimeDir 'SnowLuma-v2.4.2-win-x64.zip'
 $destination = Join-Path $runtimeDir 'app'

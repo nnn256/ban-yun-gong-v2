@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $pythonExe = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {

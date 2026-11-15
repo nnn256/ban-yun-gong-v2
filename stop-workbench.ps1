@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $stopped = $false
 for ($port = 18766; $port -le 18776; $port++) {
     try {

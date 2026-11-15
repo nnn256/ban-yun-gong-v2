@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $runtimeDir = Join-Path $projectRoot 'runtime'
 $toolsDir = Join-Path $projectRoot 'tools'

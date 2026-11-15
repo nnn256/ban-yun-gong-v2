@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts/搬运工V2-安装程序.exe')
 )
 
@@ -18,6 +18,10 @@ $uvArchiveUrl = "https://github.com/astral-sh/uv/releases/download/$uvVersion/$u
 & (Join-Path $projectRoot 'verify.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Project verification failed; installer was not built.' }
 Write-Output '[1/5] Project tests passed.'
+$portableLauncher = Join-Path $artifactRoot 'portable/搬运工V2.exe'
+$portableUv = Join-Path $artifactRoot 'portable/tools/uv.exe'
+& (Join-Path $projectRoot 'build-portable.ps1') -OutputExe $portableLauncher -UvOutput $portableUv
+if ($LASTEXITCODE -ne 0) { throw 'Portable launcher build failed; installer was not built.' }
 if (-not (Test-Path -LiteralPath $wixExe -PathType Leaf)) {
     throw "WiX Toolset v7 was not found: $wixExe"
 }
@@ -32,6 +36,7 @@ $rootFiles = @(
 foreach ($file in $rootFiles) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $payloadRoot $file)
 }
+Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $payloadRoot 'mover-v2-launcher.exe')
 
 foreach ($directory in @('astrbot_plugin_message_bridge', 'workbench')) {
     $source = Join-Path $projectRoot $directory
@@ -54,6 +59,9 @@ $forbiddenPayload = Get-ChildItem -LiteralPath $payloadRoot -Recurse -File | Whe
 }
 if ($forbiddenPayload) {
     throw "Installer payload contains local data or credentials: $($forbiddenPayload.Name -join ', ')"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'mover-v2-launcher.exe') -PathType Leaf)) {
+    throw 'Installer payload is missing its native launcher executable.'
 }
 $ruleTemplate = Get-Content -LiteralPath (Join-Path $payloadRoot 'astrbot_plugin_message_bridge/bridge_rules.example.json') -Raw | ConvertFrom-Json
 if (@($ruleTemplate.rules).Count -ne 0) {

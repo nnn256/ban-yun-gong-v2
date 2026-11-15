@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $runtimeDir = Join-Path $PSScriptRoot 'runtime'
 $toolsDir = Join-Path $PSScriptRoot 'tools'
 if (Test-Path -LiteralPath (Join-Path $toolsDir 'uv.exe') -PathType Leaf) {

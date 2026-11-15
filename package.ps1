@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
 $verify = Join-Path $projectRoot 'verify.ps1'
 & $verify

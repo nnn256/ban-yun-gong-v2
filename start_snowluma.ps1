@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $runtimeDir = Join-Path $PSScriptRoot 'runtime\SnowLuma'
 $appDir = Join-Path $runtimeDir 'app'
 $node = Join-Path $appDir 'node.exe'

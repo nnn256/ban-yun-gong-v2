@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import copy
 from dataclasses import dataclass
 from hashlib import sha256
 from time import monotonic
@@ -13,6 +14,8 @@ PLUGIN_ID = "astrbot_plugin_message_bridge"
 BRIDGE_MARKER = "[搬运工V2]"
 DEFAULT_MANAGED_PLATFORMS = ("aiocqhttp", "larkx")
 VALID_MESSAGE_TYPES = frozenset(("GroupMessage", "FriendMessage", "OtherMessage"))
+CONTENT_TYPE_ORDER = ("text", "emoji", "image", "video", "audio", "file")
+DEFAULT_CONTENT_TYPES = CONTENT_TYPE_ORDER
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class Route:
     source_account_id: str = ""
     target_account_id: str = ""
     include_self: bool = False
+    content_types: tuple[str, ...] = DEFAULT_CONTENT_TYPES
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "Route | None":
@@ -37,6 +41,14 @@ class Route:
         source_account_id = str(value.get("source_account_id", "")).strip()
         target_account_id = str(value.get("target_account_id", "")).strip()
         target_umo = str(value.get("target_umo", "")).strip()
+        raw_content_types = value.get("content_types")
+        content_types = (
+            DEFAULT_CONTENT_TYPES
+            if raw_content_types is None
+            else tuple(kind for kind in CONTENT_TYPE_ORDER if kind in raw_content_types)
+            if isinstance(raw_content_types, (list, tuple, set, frozenset))
+            else ()
+        )
         if not value.get("enabled", True):
             return None
         if source_platform not in DEFAULT_MANAGED_PLATFORMS:
@@ -55,6 +67,7 @@ class Route:
             source_account_id=source_account_id,
             target_account_id=target_account_id,
             include_self=bool(value.get("include_self", False)),
+            content_types=content_types,
         )
 
     def matches(
@@ -80,6 +93,59 @@ def valid_umo(value: str) -> bool:
         return False
     platform_id, message_type, session_id = value.split(":", 2)
     return bool(platform_id and session_id and message_type in VALID_MESSAGE_TYPES)
+
+
+def component_content_type(component: Any) -> str:
+    """Classify AstrBot components for per-route content filtering."""
+    hint = getattr(component, "_mover_content_type", "")
+    if hint in CONTENT_TYPE_ORDER:
+        return hint
+    name = type(component).__name__.lower()
+    if name in {"face", "mface", "sticker"}:
+        return "emoji"
+    if name in {"plain", "at", "text", "reply"}:
+        return "text"
+    if name in {"record", "audio", "voice"}:
+        return "audio"
+    if name == "video":
+        return "video"
+    if name == "image":
+        return "image"
+    if name == "file":
+        filename = str(getattr(component, "name", "") or getattr(component, "file", "") or "")
+        filename = filename.split("?", 1)[0].split("#", 1)[0].lower()
+        suffix = filename.rsplit(".", 1)[-1] if "." in filename else ""
+        if suffix in {"mp4", "m4v", "mov", "webm", "mkv", "avi", "3gp", "flv", "wmv"}:
+            return "video"
+        if suffix in {"silk", "wav", "mp3", "m4a", "ogg", "opus", "amr", "flac", "aac"}:
+            return "audio"
+        return "file"
+    return "text"
+
+
+def filter_message_chain(chain: Any, content_types: tuple[str, ...] | list[str] | set[str]) -> Any:
+    allowed = frozenset(content_types)
+    filtered = copy(chain)
+    filtered.chain = [
+        component for component in getattr(chain, "chain", [])
+        if component_content_type(component) in allowed
+    ]
+    return filtered
+
+
+def route_event_key(event_key: str, route: Route) -> str:
+    """Deduplicate each destination independently so one failed route can retry."""
+    material = "\0".join((
+        event_key,
+        route.source_platform,
+        route.source_platform_id,
+        route.source_account_id,
+        route.source_message_type,
+        route.source_session_id,
+        route.target_account_id,
+        route.target_umo,
+    ))
+    return sha256(material.encode("utf-8", errors="replace")).hexdigest()
 
 
 class BridgeRouter:
@@ -186,6 +252,9 @@ class SeenEvents:
         while len(self._seen) > self.max_entries:
             self._seen.popitem(last=False)
         return True
+
+    def discard(self, key: str) -> None:
+        self._seen.pop(key, None)
 
 
 def make_event_key(

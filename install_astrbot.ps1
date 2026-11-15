@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $runtimeDir = Join-Path $projectRoot 'runtime'
 $astrbotRoot = Join-Path $runtimeDir 'AstrBot'

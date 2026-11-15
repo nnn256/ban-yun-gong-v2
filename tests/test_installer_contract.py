@@ -26,6 +26,14 @@ class InstallerLaunchContractTests(unittest.TestCase):
             with self.subTest(script=script.name):
                 self.assertTrue(script.read_bytes().startswith(b"\xef\xbb\xbf"))
 
+    def test_installer_defaults_to_the_per_user_programs_folder(self):
+        bundle = (ROOT / "installer" / "Bundle.wxs").read_text(encoding="utf-8")
+        product = (ROOT / "installer" / "Product.wxs").read_text(encoding="utf-8")
+
+        self.assertIn('Value="[LocalAppDataFolder]Programs\\搬运工V2"', bundle)
+        self.assertIn('<StandardDirectory Id="PerUserProgramFilesFolder">', product)
+        self.assertNotIn('Value="D:\\搬运工V2"', product)
+
 
 if __name__ == "__main__":
     unittest.main()

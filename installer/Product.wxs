@@ -1,14 +1,13 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="搬运工V2"
            Manufacturer="搬运工V2"
-           Version="2.0.1"
+           Version="2.0.2"
            UpgradeCode="{D5231F74-AE3B-4A53-8C40-1D742FA9A391}"
            Scope="perUser">
     <SummaryInformation Description="QQ 与飞书本地消息转发工作台" Manufacturer="搬运工V2" />
     <MajorUpgrade DowngradeErrorMessage="已安装较新版本的搬运工V2。" />
     <MediaTemplate EmbedCab="yes" />
 
-    <Property Id="INSTALLFOLDER" Value="D:\搬运工V2" Secure="yes" />
     <StandardDirectory Id="PerUserProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="搬运工V2" />
     </StandardDirectory>

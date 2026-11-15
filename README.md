@@ -10,7 +10,7 @@
 
 便携版 ZIP：从 GitHub Releases 下载 ZIP，解压全部文件到同一目录，双击根目录里的 `搬运工V2.exe` 即可启动工作台并打开浏览器；首次启动需要联网下载 AstrBot/LarkAgentX 运行环境。该 ZIP 不含现有账号或映射规则，首次运行创建空映射。
 
-中文版 Windows 安装程序也可从上述 GitHub Releases 页面下载并双击运行。安装器默认使用 `D:\搬运工V2`，可在“选项”修改目录；安装结束后可从桌面或开始菜单启动。EXE/ZIP 均不包含 QQ 登录数据、飞书登录凭据、`bridge_rules.json`、`cmd_config.json` 或 `runtime` 数据。随包示例规则为空；在新目录安装会从空映射开始，安装到已有目录则保留该目录的本机登录与映射数据。若需要全新设置，请在“选项”选一个空目录，并先停止另一目录中正在运行的工作台/AstrBot，避免固定端口冲突。首次启动需要联网下载 AstrBot 运行环境和固定提交的 LarkAgentX。
+中文版 Windows 安装程序也可从上述 GitHub Releases 页面下载并双击运行。安装器默认使用当前用户的 `%LOCALAPPDATA%\Programs\搬运工V2`，可在“选项”修改目录；安装结束后可从桌面或开始菜单启动。EXE/ZIP 均不包含 QQ 登录数据、飞书登录凭据、`bridge_rules.json`、`cmd_config.json` 或 `runtime` 数据。随包示例规则为空；在新目录安装会从空映射开始，安装到已有目录则保留该目录的本机登录与映射数据。若需要全新设置，请在“选项”选一个空目录，并先停止另一目录中正在运行的工作台/AstrBot，避免固定端口冲突。首次启动需要联网下载 AstrBot 运行环境和固定提交的 LarkAgentX。
 
 在 Windows PowerShell 中运行：
 

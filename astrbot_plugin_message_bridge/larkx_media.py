@@ -3,22 +3,93 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import importlib
+import math
 import mimetypes
+import os
 import re
+import shutil
+import socket
+import struct
+import subprocess
 import tempfile
+import zlib
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import url2pathname
 
 
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MAX_MEDIA_REDIRECTS = 4
+MAX_NATIVE_DURATION_MS = 2_147_483_647
+NATIVE_UPLOAD_PART_SIZE = 4 * 1024 * 1024
 
 
 class ImageTransferError(ValueError):
     """A media failure whose message does not expose URLs or credentials."""
+
+
+class NativeMediaDeliveryUncertain(ImageTransferError):
+    """The gateway may have accepted the message; do not retry it blindly."""
+
+
+def _validate_media_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ImageTransferError("媒体地址格式无效")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ImageTransferError("媒体地址端口无效") from exc
+    if port not in {80, 443}:
+        raise ImageTransferError("媒体地址端口不受支持")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ImageTransferError("媒体地址不能指向本机或内部域名")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        if address.is_loopback or address.is_private or address.is_link_local or address.is_reserved:
+            raise ImageTransferError("媒体地址不能指向本机或内部地址")
+        addresses = {address}
+    else:
+        try:
+            resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            addresses = {ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in resolved}
+        except (OSError, ValueError) as exc:
+            raise ImageTransferError("媒体地址解析失败") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ImageTransferError("媒体地址解析到非公网 IP")
+
+
+def _download_http_bytes(url: str, max_bytes: int, timeout: tuple[int, int]) -> bytes:
+    import requests
+    current = url
+    for redirect_count in range(MAX_MEDIA_REDIRECTS + 1):
+        _validate_media_url(current)
+        with requests.get(current, timeout=timeout, stream=True, allow_redirects=False) as response:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location or redirect_count >= MAX_MEDIA_REDIRECTS:
+                    raise ImageTransferError("媒体重定向无效或次数过多")
+                current = urljoin(current, location)
+                continue
+            response.raise_for_status()
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ImageTransferError("媒体文件超过大小上限")
+            data = bytearray()
+            for chunk in response.iter_content(65536):
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise ImageTransferError("媒体文件超过大小上限")
+            return bytes(data)
+    raise ImageTransferError("媒体重定向无效或次数过多")
 
 
 def _lark_media() -> Any:
@@ -83,21 +154,7 @@ def image_bytes(source: Any) -> bytes:
         except (ValueError, binascii.Error) as exc:
             raise ImageTransferError("图片 base64 数据无效") from exc
     if source.startswith(("http://", "https://")):
-        import requests
-
-        chunks = []
-        total = 0
-        with requests.get(source, timeout=(10, 45), stream=True) as response:
-            response.raise_for_status()
-            declared_size = response.headers.get("content-length", "")
-            if declared_size.isdigit() and int(declared_size) > MAX_IMAGE_BYTES:
-                raise ImageTransferError("图片超过 25MB 上限")
-            for chunk in response.iter_content(65536):
-                total += len(chunk)
-                if total > MAX_IMAGE_BYTES:
-                    raise ImageTransferError("图片超过 25MB 上限")
-                chunks.append(chunk)
-        return _checked(b"".join(chunks))
+        return _checked(_download_http_bytes(source, MAX_IMAGE_BYTES, (10, 45)))
     if source.startswith("file:"):
         parsed = urlsplit(source)
         path = url2pathname(parsed.path)
@@ -192,19 +249,7 @@ def attachment_bytes(source: Any) -> bytes:
         except (ValueError, binascii.Error) as exc:
             raise ImageTransferError("附件 base64 数据无效") from exc
     if reference.startswith(("http://", "https://")):
-        import requests
-
-        data = bytearray()
-        with requests.get(reference, timeout=(10, 90), stream=True) as response:
-            response.raise_for_status()
-            declared = response.headers.get("content-length", "")
-            if declared.isdigit() and int(declared) > MAX_ATTACHMENT_BYTES:
-                raise ImageTransferError("附件超过 100MB 上限")
-            for chunk in response.iter_content(65536):
-                data.extend(chunk)
-                if len(data) > MAX_ATTACHMENT_BYTES:
-                    raise ImageTransferError("附件超过 100MB 上限")
-        return _attachment_checked(bytes(data))
+        return _attachment_checked(_download_http_bytes(reference, MAX_ATTACHMENT_BYTES, (10, 90)))
     if reference.startswith("file:"):
         parsed = urlsplit(reference)
         reference = url2pathname(parsed.path)
@@ -283,8 +328,251 @@ def attachment_filename(filename: str, data: bytes, kind: str = "file", mime: st
     return name
 
 
+def _ffmpeg_executable() -> str:
+    configured = os.environ.get("MOVER_FFMPEG", "").strip()
+    if configured:
+        if not Path(configured).is_file():
+            raise ImageTransferError("配置的 FFmpeg 程序不存在")
+        return str(Path(configured).resolve())
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        executable = shutil.which("ffmpeg")
+    if not executable or not Path(executable).is_file():
+        raise ImageTransferError("原生语音和视频需要本机 FFmpeg，请安装 imageio-ffmpeg")
+    return str(executable)
+
+
+def _run_ffmpeg(arguments: list[str]) -> None:
+    try:
+        result = subprocess.run(
+            [_ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *arguments],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ImageTransferError("本机媒体转码失败或超时，未上传原生媒体") from exc
+    if result.returncode:
+        raise ImageTransferError("媒体格式无法解码或转码，未上传原生媒体")
+
+
+def _validated_duration(milliseconds: int) -> int:
+    if isinstance(milliseconds, bool) or not isinstance(milliseconds, int) or not 1 <= milliseconds <= MAX_NATIVE_DURATION_MS:
+        raise ImageTransferError("媒体时长无效或超出原生消息范围")
+    return milliseconds
+
+
+def _opus_duration_ms(data: bytes) -> int:
+    """Read the final Ogg granule in 48 kHz Opus samples, excluding pre-skip."""
+    offset, serial, preskip, final_granule = 0, None, None, None
+    while offset < len(data):
+        if len(data) - offset < 27 or data[offset:offset + 4] != b"OggS" or data[offset + 4] != 0:
+            raise ImageTransferError("原生语音不是有效的 Ogg Opus 文件")
+        segments = data[offset + 26]
+        header_end = offset + 27 + segments
+        if header_end > len(data):
+            raise ImageTransferError("原生语音 Ogg 页被截断")
+        page_end = header_end + sum(data[offset + 27:header_end])
+        if page_end > len(data):
+            raise ImageTransferError("原生语音 Ogg 数据被截断")
+        page_serial = struct.unpack_from("<I", data, offset + 14)[0]
+        payload = data[header_end:page_end]
+        if serial is None:
+            if not payload.startswith(b"OpusHead") or len(payload) < 19:
+                raise ImageTransferError("原生语音需要 Opus 编码")
+            serial = page_serial
+            preskip = struct.unpack_from("<H", payload, 10)[0]
+        elif page_serial != serial:
+            raise ImageTransferError("原生语音不接受多个 Ogg 流")
+        granule = struct.unpack_from("<Q", data, offset + 6)[0]
+        if granule != 0xFFFFFFFFFFFFFFFF:
+            final_granule = granule
+        offset = page_end
+    if preskip is None or final_granule is None or final_granule <= preskip:
+        raise ImageTransferError("原生语音没有有效时长")
+    return _validated_duration(math.ceil((final_granule - preskip) * 1000 / 48_000))
+
+
+def _mp4_duration_ms(data: bytes) -> int:
+    """Read the normalized MP4 movie timescale rather than trusting a filename."""
+    def boxes(start: int, end: int):
+        position = start
+        while position < end:
+            if end - position < 8:
+                raise ImageTransferError("原生视频 MP4 数据被截断")
+            size, kind = struct.unpack_from(">I4s", data, position)
+            header = 8
+            if size == 1:
+                if end - position < 16:
+                    raise ImageTransferError("原生视频 MP4 数据被截断")
+                size, header = struct.unpack_from(">Q", data, position + 8)[0], 16
+            elif size == 0:
+                size = end - position
+            if size < header or position + size > end:
+                raise ImageTransferError("原生视频 MP4 文件结构无效")
+            yield kind, position + header, position + size
+            position += size
+
+    for kind, start, end in boxes(0, len(data)):
+        if kind != b"moov":
+            continue
+        for child, payload, child_end in boxes(start, end):
+            if child != b"mvhd":
+                continue
+            version = data[payload] if payload < child_end else -1
+            if version == 0 and child_end - payload >= 20:
+                scale, duration = struct.unpack_from(">II", data, payload + 12)
+            elif version == 1 and child_end - payload >= 32:
+                scale = struct.unpack_from(">I", data, payload + 20)[0]
+                duration = struct.unpack_from(">Q", data, payload + 24)[0]
+            else:
+                raise ImageTransferError("原生视频时长字段无效")
+            if scale <= 0 or duration <= 0:
+                raise ImageTransferError("原生视频没有有效时长")
+            return _validated_duration(math.ceil(duration * 1000 / scale))
+    raise ImageTransferError("原生视频没有 MP4 时长元数据")
+
+
+def _normalize_native_media(source: Any, kind: str, directory: Path) -> dict[str, Any]:
+    data = attachment_bytes(source)
+    if kind == "audio" and data.startswith((b"#!SILK_V3", b"\x02#!SILK_V3")):
+        decoded = _silk_to_wav(data)
+        if decoded is data or not decoded.startswith(b"RIFF"):
+            raise ImageTransferError("QQ SILK 语音解码失败，未改发普通文件")
+        data = decoded
+    extension = _media_extension(data, kind)
+    allowed = {"audio": {".wav", ".mp3", ".ogg", ".flac", ".amr", ".m4a"},
+               "video": {".mp4", ".webm", ".avi"}}
+    if extension not in allowed[kind]:
+        raise ImageTransferError("不支持的原生媒体容器，未改发普通文件")
+    input_path = directory / ("source" + extension)
+    input_path.write_bytes(data)
+    output_path = directory / ("audio.ogg" if kind == "audio" else "video.mp4")
+    common = ["-protocol_whitelist", "file,pipe", "-i", str(input_path)]
+    if kind == "audio":
+        _run_ffmpeg([*common, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "48000",
+                     "-c:a", "libopus", "-b:a", "32k", "-fs", str(MAX_ATTACHMENT_BYTES + 1), str(output_path)])
+        normalized = _attachment_checked(output_path.read_bytes())
+        return {"path": output_path, "mime": "audio/ogg", "duration_ms": _opus_duration_ms(normalized), "preview": None}
+    _run_ffmpeg([*common, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
+                 "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 "-b:a", "128k", "-movflags", "+faststart", "-fs", str(MAX_ATTACHMENT_BYTES + 1), str(output_path)])
+    normalized = _attachment_checked(output_path.read_bytes())
+    duration = _mp4_duration_ms(normalized)
+    preview = directory / "cover.jpg"
+    _run_ffmpeg(["-protocol_whitelist", "file,pipe", "-i", str(output_path),
+                 "-map", "0:v:0", "-frames:v", "1", "-q:v", "3", str(preview)])
+    _checked(preview.read_bytes())
+    return {"path": output_path, "mime": "video/mp4", "duration_ms": duration, "preview": preview}
+
+
+def _upload_native_media(auth: Any, path: Path, kind: str, mime: str, preview_key: str = "") -> dict[str, Any]:
+    media = _lark_media()
+    pan = media._pan()
+    file_type = pan.CompleteFileUploadRequest.FileType.Value("AUDIO" if kind == "audio" else "MEDIA")
+    size = path.stat().st_size
+    if not 0 < size <= MAX_ATTACHMENT_BYTES:
+        raise ImageTransferError("原生媒体内容为空或超过 100MB 上限")
+    created = pan.CreateFileUploadResponse.FromString(media._post(
+        auth, "/upload/create", "创建原生媒体上传", "application/x-protobuf",
+        data=pan.CreateFileUploadRequest(fileType=file_type, fileName=path.name, fileSize=size).SerializeToString()))
+    key = created.uploadId
+    if not re.fullmatch(r"[\w.-]{1,200}", key or ""):
+        raise ImageTransferError("原生媒体上传未返回有效资源标识")
+    complete = pan.CompleteFileUploadRequest(uploadId=key, fileType=file_type, fileName=path.name, mime=mime)
+    if preview_key:
+        complete.imageKeys.coverKey = preview_key
+    with path.open("rb") as stream:
+        part_id = 0
+        while chunk := stream.read(NATIVE_UPLOAD_PART_SIZE):
+            part_id += 1
+            part = pan.UploadFilePartResponse.FromString(media._post(
+                auth, "/upload/part", "上传原生媒体分块", "application/octet-stream",
+                params={"upload_id": key, "part_id": part_id}, data=chunk))
+            crc = zlib.crc32(chunk)
+            if part.partId != part_id or part.crc32 != crc:
+                raise ImageTransferError("原生媒体上传分块校验失败")
+            complete.partToCrc32[part_id] = crc
+    result = pan.CompleteFileUploadResponse.FromString(media._post(
+        auth, "/upload/complete", "完成原生媒体上传", "application/x-protobuf", data=complete.SerializeToString()))
+    if result.code != 0:
+        raise ImageTransferError("原生媒体上传完成校验失败")
+    return {"key": key, "name": path.name, "size": size, "mime": mime,
+            "crypto_token": result.cryptoToken, "preview_key": preview_key}
+
+
+def _native_message_request(chat_id: str, uploaded: dict[str, Any], kind: str, duration_ms: int):
+    gateway = importlib.import_module("larkx.proto.gateway")
+    ids = importlib.import_module("larkx.proto.ids")
+    request = gateway._lark_all().messages.PutMessageRequest()
+    request.chatId, request.cid = str(chat_id), ids.generate_request_cid()
+    request.isNotified, request.version = True, 1
+    duration_ms = _validated_duration(duration_ms)
+    # Both receive decoders divide these fields by 1000 when displaying seconds.
+    if kind == "audio":
+        request.type = 7
+        request.content.audioKey = str(uploaded["key"])
+        request.content.audioDuration = duration_ms
+    elif kind == "video":
+        request.type = 15
+        request.content.fileKey = str(uploaded["key"])
+        request.content.fileName = str(uploaded["name"])
+        request.content.fileSize = int(uploaded["size"])
+        request.content.fileMime = str(uploaded["mime"])
+        request.content.duration = duration_ms
+        if uploaded.get("preview_key"):
+            request.content.imageKey = str(uploaded["preview_key"])
+    else:
+        raise ImageTransferError("原生媒体类型必须是 audio 或 video")
+    if kind == "video" and uploaded.get("preview_key"):
+        # MEDIA follows the same cover binding as IMAGE; a completed file
+        # upload's cryptoToken is not accepted as the video's cover token.
+        request.content.cryptoToken = str(uploaded["preview_key"])
+    elif uploaded.get("crypto_token"):
+        request.content.cryptoToken = str(uploaded["crypto_token"])
+    return request
+
+
+def send_native_media(client: Any, chat_id: str, source: Any, kind: str) -> str:
+    """Normalize, upload as AUDIO/MEDIA, and require a server message receipt.
+
+    Platform acceptance still requires a controlled live test. This path never
+    falls back to FILE if decoding, native upload, or native sending fails.
+    """
+    if kind not in {"audio", "video"}:
+        raise ImageTransferError("原生媒体类型必须是 audio 或 video")
+    if client is None or not str(chat_id).strip() or not callable(getattr(client, "_gateway_post", None)):
+        raise ImageTransferError("飞书原生媒体客户端或目标会话不可用")
+    media = _lark_media()
+    with tempfile.TemporaryDirectory(prefix="mover-native-") as directory:
+        normalized = _normalize_native_media(source, kind, Path(directory))
+        duration = _validated_duration(normalized["duration_ms"])
+        preview_key = ""
+        if normalized.get("preview"):
+            preview_key = media.upload_image(client.auth, str(normalized["preview"]))
+            if not preview_key:
+                raise ImageTransferError("视频封面上传未返回资源标识")
+        uploaded = _upload_native_media(client.auth, normalized["path"], kind, normalized["mime"], preview_key)
+        request = _native_message_request(chat_id, uploaded, kind, duration)
+        builders = importlib.import_module("larkx.proto.builders")
+        ids = importlib.import_module("larkx.proto.ids")
+        packet = builders.wrap_packet(5, request, ids.generate_long_request_id())
+        try:
+            response = client._gateway_post(packet)
+        except Exception as exc:
+            raise NativeMediaDeliveryUncertain("原生媒体发送结果未知，请核对目标会话后再决定是否重发") from exc
+        try:
+            message_id = builders.decode_put_message_response(response)
+        except Exception as exc:
+            raise NativeMediaDeliveryUncertain("原生媒体发送响应无法确认，请核对目标会话后再决定是否重发") from exc
+        if not message_id or str(message_id).startswith("-"):
+            raise ImageTransferError("飞书没有返回有效的原生媒体消息回执")
+        return str(message_id)
+
+
 def send_attachment(client: Any, chat_id: str, source: Any, filename: str = "", kind: str = "file") -> str | None:
-    """Send a real FILE attachment, including audio/video when native upload is unavailable.
+    """Explicitly send a FILE attachment, even when its bytes contain audio/video.
 
     The pinned LarkAgentX compose API supports IMAGE and FILE uploads. It has
     no measured audio/video upload contract, so this method never claims that

@@ -224,7 +224,7 @@ main { width: min(100%, 1240px); margin: 0 auto; padding: 31px 34px 0; }
 .filter-tab.active { border-color: #d4e6dc; color: var(--teal-dark); background: #edf6f1; }
 .filter-tab.active span { color: var(--teal-dark); }
 .rules-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
-.rules-table { width: 100%; border-collapse: collapse; min-width: 690px; }
+.rules-table { width: 100%; border-collapse: collapse; min-width: 830px; }
 .rules-table th { height: 35px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--muted); background: #f8faf8; text-align: left; font-size: 9px; font-weight: 600; }
 .rules-table td { height: 52px; padding: 7px 12px; border-bottom: 1px solid #edf1ee; color: var(--ink-soft); font-size: 10px; }
 .rules-table tr:last-child td { border-bottom: 0; }
@@ -259,7 +259,9 @@ main { width: min(100%, 1240px); margin: 0 auto; padding: 31px 34px 0; }
 .toggle[aria-pressed="true"] { background: var(--teal); }
 .toggle[aria-pressed="true"]::after { transform: translateX(13px); }
 .table-action { border: 0; color: var(--red); background: transparent; font-size: 10px; }
+.table-action.edit { color: var(--teal-dark); }
 .table-action:hover { text-decoration: underline; text-underline-offset: 3px; }
+.route-content-types { min-width: 145px; color: var(--ink-soft); line-height: 1.65; }
 
 .settings-section { max-width: 810px; padding: 18px 19px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .settings-section + .settings-section { margin-top: 16px; }
@@ -299,6 +301,11 @@ main { width: min(100%, 1240px); margin: 0 auto; padding: 31px 34px 0; }
 .mapping-dialog .field-label { display: block; margin: 0 0 6px; font-weight: 600; }
 .mapping-dialog select { max-width: 230px; }
 .pair-grid select { max-width: none; }
+.content-type-fieldset { margin: 0 0 12px; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 5px; }
+.content-type-fieldset legend { padding: 0 5px; color: var(--ink-soft); font-size: 10px; font-weight: 620; }
+.content-type-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px 14px; }
+.content-type-options label { display: flex; min-width: 0; align-items: center; gap: 7px; margin: 0; color: var(--ink-soft); font-size: 10px; font-weight: 500; }
+.mapping-dialog .content-type-options input { width: 15px; min-width: 15px; height: 15px; min-height: 15px; padding: 0; accent-color: var(--teal-dark); }
 .include-self-option { display: flex; align-items: center; gap: 7px; margin-top: 12px; }
 .mapping-dialog .include-self-option input { width: 15px; height: 15px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 18px; }
@@ -405,6 +412,7 @@ main { width: min(100%, 1240px); margin: 0 auto; padding: 31px 34px 0; }
   .bootstrap-fields { grid-template-columns: 1fr; }
   .page-footer { font-size: 8px; }
   .pair-grid { grid-template-columns: 1fr; gap: 7px; }
+  .content-type-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pair-divider { height: 16px; }
   .pair-grid fieldset { padding: 11px; }
   .mapping-dialog form { padding: 16px 14px 14px; }
@@ -430,3 +438,14 @@ main { width: min(100%, 1240px); margin: 0 auto; padding: 31px 34px 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
 }
+.log-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 12px 0; }
+.log-filters label { display: grid; gap: 5px; font-size: 12px; min-width: 110px; }
+.log-filters input, .log-filters select { min-width: 0; max-width: 200px; padding: 8px; border: 1px solid #deded9; border-radius: 6px; background: transparent; color: inherit; }
+.log-filters .log-live { display: flex; align-items: center; padding: 8px 0; }
+.log-list { max-height: 430px; overflow: auto; }
+.log-entry span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-error { color: #ae3540; }
+.log-warning { color: #986823; }
+.background-card { padding: 24px; margin-bottom: 24px; border: 1px solid #deded9; border-radius: 12px; }
+.background-options { display: grid; gap: 12px; margin-top: 16px; }
+.background-options label { display: flex; gap: 8px; align-items: center; }

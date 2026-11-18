@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import workbench_server as server
@@ -21,6 +22,123 @@ def route(source, source_id, source_session, target_id, target_session, name):
 
 
 class WorkbenchConfigTests(unittest.TestCase):
+    def test_slow_astrbot_launch_stays_pending_without_spawning_duplicate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".astrbot").touch()
+            (root / "data" / "plugins").mkdir(parents=True)
+            (root / "data" / "cmd_config.json").write_text('{"dashboard":{"password":"fixture"}}', encoding="utf-8")
+            executable = root / "astrbot.exe"
+            executable.touch()
+            launch = SimpleNamespace(pid=202, poll=lambda: None)
+            with (
+                patch.object(server, "ASTRBOT_EXE", executable),
+                patch.object(server, "_astrbot_process", None),
+                patch.object(server, "_initial_password", None),
+                patch.object(server, "_load_bootstrap_password", return_value=None),
+                patch.object(server, "load_settings", return_value={"astrbot_root": str(root), "astrbot_port": 7185}),
+                patch.object(server, "port_open", return_value=False),
+                patch.object(server, "_managed_astrbot_pid", return_value=None) as owner,
+                patch.object(server.subprocess, "Popen", return_value=launch) as spawn,
+                patch.object(server.time, "sleep"),
+            ):
+                self.assertTrue(server.start_astrbot()["started"])
+                self.assertTrue(server.start_astrbot()["already_starting"])
+                owner.return_value = 303
+                self.assertEqual(server.start_astrbot()["pid"], 303)
+                spawn.assert_called_once()
+
+    def test_load_settings_atomically_repairs_deleted_extraction_root_to_initialized_local_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = root / "workbench.settings.json"
+            local = root / "runtime" / "AstrBot"
+            (local / "data" / "plugins").mkdir(parents=True)
+            (local / ".astrbot").touch()
+            deleted = root / "deleted-Temp" / "MoverV2Source" / "runtime" / "AstrBot"
+            original = {"astrbot_root": str(deleted), "astrbot_port": 7199, "future_option": "preserved"}
+            settings.write_text(json.dumps(original), encoding="utf-8")
+            original_replace = server.os.replace
+            with (
+                patch.object(server, "ROOT", root),
+                patch.object(server, "SETTINGS_FILE", settings),
+                patch.object(server.os, "replace", wraps=original_replace) as replace,
+            ):
+                result = server.load_settings()
+                self.assertEqual(result, {"astrbot_root": str(local.resolve()), "astrbot_port": 7199})
+                replace.assert_called_once_with(settings.with_suffix(".json.tmp"), settings)
+                self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), {**original, "astrbot_root": str(local.resolve())})
+                self.assertFalse(settings.with_suffix(".json.tmp").exists())
+                self.assertEqual(server.load_settings(), result)
+                replace.assert_called_once()
+            self.assertFalse(deleted.exists())
+
+    def test_load_settings_preserves_valid_custom_root_without_rewriting_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            custom = root / "custom-astrbot"
+            local = root / "runtime" / "AstrBot"
+            for runtime in (custom, local):
+                (runtime / "data" / "plugins").mkdir(parents=True)
+                (runtime / ".astrbot").touch()
+            settings = root / "workbench.settings.json"
+            original = ("\ufeff" + json.dumps({"astrbot_root": str(custom), "astrbot_port": 7255}, indent=3)).encode("utf-8")
+            settings.write_bytes(original)
+            with patch.object(server, "ROOT", root), patch.object(server, "SETTINGS_FILE", settings), patch.object(server, "_atomic_json") as write:
+                self.assertEqual(server.load_settings(), {"astrbot_root": str(custom), "astrbot_port": 7255})
+                write.assert_not_called()
+            self.assertEqual(settings.read_bytes(), original)
+
+    def test_load_settings_does_not_choose_uninitialized_local_runtime(self):
+        for missing in ("marker", "plugin_directory"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                local = root / "runtime" / "AstrBot"
+                local.mkdir(parents=True)
+                if missing != "marker":
+                    (local / ".astrbot").touch()
+                if missing != "plugin_directory":
+                    (local / "data" / "plugins").mkdir(parents=True)
+                settings = root / "workbench.settings.json"
+                deleted = root / "deleted-extraction"
+                original = json.dumps({"astrbot_root": str(deleted), "astrbot_port": 6185}).encode("utf-8")
+                settings.write_bytes(original)
+                with patch.object(server, "ROOT", root), patch.object(server, "SETTINGS_FILE", settings), patch.object(server, "_atomic_json") as write:
+                    self.assertEqual(server.load_settings()["astrbot_root"], str(deleted))
+                    write.assert_not_called()
+                self.assertEqual(settings.read_bytes(), original)
+
+    def test_load_settings_keeps_initialized_custom_root_before_plugin_install(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            custom = root / "custom-astrbot"
+            custom.mkdir()
+            (custom / ".astrbot").touch()
+            local = root / "runtime" / "AstrBot"
+            (local / "data" / "plugins").mkdir(parents=True)
+            (local / ".astrbot").touch()
+            settings = root / "workbench.settings.json"
+            original = json.dumps({"astrbot_root": str(custom), "astrbot_port": 6185}).encode("utf-8")
+            settings.write_bytes(original)
+            with patch.object(server, "ROOT", root), patch.object(server, "SETTINGS_FILE", settings), patch.object(server, "_atomic_json") as write:
+                self.assertEqual(server.load_settings()["astrbot_root"], str(custom))
+                write.assert_not_called()
+            self.assertEqual(settings.read_bytes(), original)
+
+    def test_load_settings_does_not_rewrite_unrelated_malformed_settings_as_root_migration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            local = root / "runtime" / "AstrBot"
+            (local / "data" / "plugins").mkdir(parents=True)
+            (local / ".astrbot").touch()
+            settings = root / "workbench.settings.json"
+            original = b"{invalid settings"
+            settings.write_bytes(original)
+            with patch.object(server, "ROOT", root), patch.object(server, "SETTINGS_FILE", settings), patch.object(server, "_atomic_json") as write:
+                self.assertEqual(server.load_settings(), server.DEFAULT_SETTINGS)
+                write.assert_not_called()
+            self.assertEqual(settings.read_bytes(), original)
+
     def test_fresh_plugin_runtime_overrides_stale_larkx_bridge_file(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -107,6 +225,15 @@ class WorkbenchConfigTests(unittest.TestCase):
         self.assertEqual(result["rules"][0]["source_account_id"], "10000001")
         self.assertEqual(result["rules"][1]["target_account_id"], "10000001")
 
+    def test_rule_content_types_default_to_all_and_custom_types_are_normalized(self):
+        value = route("aiocqhttp", "qq_bridge", "12345", "larkx", "chat", "typed")
+        self.assertEqual(server.validate_rules({"rules": [value]})["rules"][0]["content_types"], ["text", "emoji", "image", "video", "audio", "file"])
+        value["content_types"] = ["audio", "text"]
+        self.assertEqual(server.validate_rules({"rules": [value]})["rules"][0]["content_types"], ["text", "audio"])
+        value["content_types"] = []
+        with self.assertRaisesRegex(ValueError, "至少选择一种"):
+            server.validate_rules({"rules": [value]})
+
     def test_disabled_route_is_persistable(self):
         value = route("aiocqhttp", "qq", "12345", "larkx", "77000001", "paused")
         value["enabled"] = False
@@ -143,6 +270,29 @@ class WorkbenchConfigTests(unittest.TestCase):
                 resumed = server.set_bridge_enabled(True)
                 self.assertTrue(resumed["enabled"])
                 self.assertEqual(len(server.read_rules(root)["rules"]), 1)
+
+    def test_saving_self_switch_preserves_global_pause_and_only_validates_new_directions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".astrbot").touch()
+            forward = route("aiocqhttp", "qq", "12345", "larkx", "77000001", "existing")
+            reverse = route("larkx", "default", "77000001", "qq", "12345", "new")
+            path = root / "bridge_rules.json"
+            path.write_text(json.dumps({"rules": [forward], "bridge_enabled": False}), encoding="utf-8")
+            with (
+                patch.object(server, "astrbot_root", return_value=root),
+                patch.object(server, "plugin_destination", return_value=root),
+                patch.object(server, "rules_path", return_value=path),
+                patch.object(server, "mapping_discovery", return_value={"qq_instances": [], "feishu_chats": []}) as discovery,
+            ):
+                saved = server.save_workbench_rules({"rules": [{**forward, "include_self": True}]})
+                discovery.assert_not_called()
+                self.assertFalse(saved["bridge_enabled"])
+                self.assertTrue(server.read_rules(root)["rules"][0]["include_self"])
+                original_bytes = path.read_bytes()
+                with self.assertRaises(ValueError):
+                    server.save_workbench_rules({"rules": [forward, reverse]})
+                self.assertEqual(path.read_bytes(), original_bytes)
 
     def test_qq_to_qq_and_feishu_to_feishu_routes_are_verified(self):
         discovery = {
@@ -330,8 +480,18 @@ class WorkbenchConfigTests(unittest.TestCase):
             self.assertEqual(updated["networks"]["wsClients"][0]["accessToken"], "preserve-this-existing-value")
             bridge = updated["networks"]["wsClients"][1]
             self.assertEqual(bridge["url"], "ws://127.0.0.1:6199/ws")
+            self.assertTrue(bridge["reportSelfMessage"])
             self.assertNotIn("accessToken", bridge)
             self.assertTrue(Path(result["backup"]).is_file())
+
+    def test_existing_mover_node_enables_self_reports_without_modifying_other_nodes(self):
+        other = {"name": "other", "url": "ws://127.0.0.1:9000/ws", "reportSelfMessage": False}
+        mover = {"name": "mover-v2-astrbot", "url": "ws://127.0.0.1:6199/ws", "reportSelfMessage": False}
+        config = {"networks": {"wsClients": [dict(other), dict(mover)]}}
+        server._snowluma_ws_client_config(config)
+        self.assertEqual(config["networks"]["wsClients"][0], other)
+        self.assertTrue(config["networks"]["wsClients"][1]["reportSelfMessage"])
+        self.assertEqual(len(config["networks"]["wsClients"]), 2)
 
     def test_invalid_snowluma_config_is_left_unchanged(self):
         with tempfile.TemporaryDirectory() as temp:

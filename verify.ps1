@@ -36,7 +36,7 @@ try {
         Write-Output 'JavaScript syntax check passed.'
     }
 
-    $psFiles = Get-ChildItem -LiteralPath $projectRoot -Filter '*.ps1' -File -Recurse
+    $psFiles = @(Get-ChildItem -LiteralPath $projectRoot -Filter '*.ps1' -File) + @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'installer') -Filter '*.ps1' -File)
     foreach ($script in $psFiles) {
         $tokens = $null
         $parseErrors = $null

@@ -1,27 +1,35 @@
-搬运工V2 验证记录
+2.0.9 Windows PowerShell 5.1 update and background startup — 2026-11-18 Asia/Shanghai
 
-功能覆盖
-- QQ 与飞书可分别作为转发来源和目标，覆盖 QQ→QQ、QQ→飞书、飞书→QQ、飞书→飞书。
-- 支持多账号路由、同一来源多个目标、本人消息开关和全局暂停/恢复。
-- 支持文本、图片、表情、语音、视频及文件的媒体转换；目标平台是否提供原生播放器取决于平台接口能力。
-- 不调用大模型；LarkAgentX agent backend 固定为 none。
+- Update and bootstrap call the background Python helper as a script, avoiding Windows PowerShell 5.1 native argument quoting.
+- A new release can stop a running 2.0.8 installation without invoking the old stop script. A workbench still serving old code after an in-place extraction is stopped and restarted.
+- The updater preserves existing platform login files, mappings and background settings. Manual workbench startup honors the saved choices; Windows login startup skips when recovery is disabled.
+- The workbench starts without a console and no longer inherits launcher output handles. The launcher can finish while the workbench remains online.
+- Isolated update tests use Windows PowerShell 5.1, a real detached watchdog, and local fixture workbench services. They do not log in or send real messages.
 
-自动化验证
-- `verify.ps1`：115 项测试通过。
-- Python、JavaScript 与 PowerShell 语法检查通过。
-- 所有随包 PowerShell 脚本均含 UTF-8 BOM，并由 Windows PowerShell 5.1 解析通过。
-- 便携 ZIP 展开后运行启动器自检通过；ZIP 不包含 `runtime`、真实 `bridge_rules.json`、账号登录凭据或工作台用户设置。
-- 随包 `bridge_rules.example.json` 的规则数组为空。
+2.0.8 native videos, merged records and mapping edits — 2026-11-18 Asia/Shanghai
 
-本机启动验证
-- `mover-v2-launcher.exe` 成功启动本地工作台，`http://127.0.0.1:18766/` 返回 HTTP 200。
-- 工作台启动 AstrBot 后，`http://127.0.0.1:6185/` 返回 HTTP 200。
-- 本次未通过真实 QQ/飞书会话发送测试消息；线上转发仍应在用户自行设置的映射中验证。
+- Feishu rich-text and merged messages use ordered, downloadable parts rather than generated summaries. Native video requests use Feishu MEDIA or OneBot video. Unsupported or failed media does not fall back to a file or summary.
+- Mapping edits can add/remove the reciprocal direction. The per-route self-message flag persists independently; it is off by default. Failed saves stay in the editor without replacing the saved rules.
+- Upgrade the owned SnowLuma node in existing account snapshots as well as the global configuration; unrelated connectors and mapping flags are preserved.
+- A slow AstrBot start can finish in the background while its ownership record is pending; repeated start requests wait for the same launch.
+- Tests cover real LarkAgentX protobuf push decoding, native request serialization, FFmpeg conversion, QQ merged-record expansion, filtering, retries, and mapping persistence.
+- The native requests are verified in isolation. Confirm client playback with a new message in an authorized live chat after updating.
 
-Windows 安装器
-- 安装器为 WiX Burn EXE，包含 per-user MSI、中文界面和原生 `mover-v2-launcher.exe`。
-- 安装器完成页、桌面快捷方式和开始菜单快捷方式均启动原生 EXE；它再调用工作台 PowerShell 启动脚本并记录失败日志。
-- 安装程序包含官方 uv 0.13.8；归档 SHA-256 经校验。首次启动需要联网安装 AstrBot 与固定提交的 LarkAgentX。
-- 安装包不含 QQ/飞书登录数据、实际群映射、`cmd_config.json`、工作台密码或 `runtime`；新目录从空规则开始。
-- WiX 构建成功；MSI ICE 校验退出码为 0（存在 per-user 固定目录的 ICE48/ICE91 警告）。安装器未数字签名。
-- 未执行 MSI 安装/卸载冒烟测试；本地策略拒绝了针对临时目录运行 `msiexec` 的测试命令。
+2.0.7 self-message forwarding and hidden background launch — 2026-11-18 Asia/Shanghai
+
+Fixes:
+- Enable reportSelfMessage only on the owned SnowLuma WebSocket node, while every route include_self remains false unless explicitly enabled. Existing external nodes, login data and rules are retained. Upgrading this node requires connector restart.
+- Resolve the verified peer for QQ self-sent private messages before route matching, deduplication and forwarding-receipt filtering. Missing peers do not route into the logged-in account's own session.
+- Native EXE defaults to hidden background with NoBrowser/SkipDesktopActions. Windows login startup uses the native launcher and preserves manual-stop preferences through ResumeBackground. Background failures log and exit without a modal dialog.
+- Recover owned Windows AstrBot launcher trees after a collector exit by verifying the recorded identity, exact launcher path and descendant working directory.
+- Installer shortcuts offer hidden background and explicit workbench opening separately.
+- Background VBS starts without a command window; CMD entries hand off and exit. The separate open-workbench VBS explicitly enables browser/login setup. Service and watchdog recovery/logging continue independently.
+
+Verification:
+- Real C# compilation and launcher behavior checks cover background/open/resume modes, no visible PowerShell console, detached VBS/CMD entry, failures without blocking dialogs and single-instance behavior.
+- Plugin regressions cover self-message toggles on/off, group/private paths, QQ peer variants, unknown-peer rejection, duplicate events and bridge receipts. Feishu private self-message filtering is included.
+- Upgrade regressions cover changing only the owned WS node and preserving rules/default-off state.
+- package.ps1 runs the full unittest suite and Python/JavaScript/PowerShell syntax checks before sealing the release. The exact final output is retained alongside the deliverable.
+
+Limits:
+No real platform message has been sent during this continuation. Live self-message delivery still requires an online authenticated QQ/Feishu session. Hidden launch applies to program/service consoles and browser launch; platform QR/relogin UI may appear when required by the platform. Display-off operation is supported; sleep, hibernate, sign-out, shutdown and network loss interrupt forwarding. CMD may flash while handing off; VBS/native EXE avoids creating a CMD window.

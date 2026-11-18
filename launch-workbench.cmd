@@ -1,11 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-workbench.ps1"
-if errorlevel 1 (
-  echo.
-  echo 搬运工V2 启动失败。请检查 runtime\logs 和 runtime\AstrBot\data\logs 中的错误日志。
-  pause
-  exit /b 1
-)
-endlocal
+chcp 65001 >nul
+rem Native launcher verifies update-and-start.ps1 and runs services without a console.
+if not exist "%~dp0mover-v2-launcher.exe" exit /b 2
+start "" /b "%~dp0mover-v2-launcher.exe" --background %*
+exit /b %errorlevel%

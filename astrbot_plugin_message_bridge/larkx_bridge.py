@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .bridge_core import SentMessageIds
+from .bridge_core import SentMessageIds, component_content_type
 from . import larkx_media
 from .qq_emojis import find_face_image
 
@@ -110,13 +110,15 @@ class LarkAgentXBridge:
                             return False
                         self._sent_ids.add(str(chat_id), str(message_id))
                         accepted = True
-                    elif kind in {"image", "record", "video", "file"}:
+                    elif component_content_type(component) in {"image", "emoji", "record", "video", "audio", "file"}:
                         if not flush_text():
                             return False
-                        if kind == "image":
+                        media_kind = component_content_type(component)
+                        if media_kind in {"image", "emoji"}:
                             message_id = larkx_media.send_image(self.client, chat_id, component)
+                        elif media_kind in {"audio", "video"}:
+                            message_id = larkx_media.send_native_media(self.client, chat_id, component, kind=media_kind)
                         else:
-                            media_kind = "audio" if kind == "record" else kind
                             message_id = larkx_media.send_attachment(self.client, chat_id, component, kind=media_kind)
                         if not message_id:
                             return False
@@ -132,6 +134,8 @@ class LarkAgentXBridge:
                         if isinstance(value, str):
                             text_parts.append(value)
                 return flush_text() and accepted
+            except larkx_media.NativeMediaDeliveryUncertain:
+                raise
             except Exception as exc:
                 self.plugin.log_larkx_error("发送飞书图片或文字失败", exc)
                 return False

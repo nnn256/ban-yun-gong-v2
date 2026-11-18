@@ -8,12 +8,9 @@ $artifactRoot = Join-Path $projectRoot 'artifacts'
 $buildRoot = Join-Path $artifactRoot ('.installer-build-' + [guid]::NewGuid().ToString('N'))
 $cacheRoot = Join-Path $artifactRoot '.installer-cache'
 $payloadRoot = Join-Path $buildRoot 'payload'
-$downloads = Join-Path $buildRoot 'downloads'
 $wixExe = 'C:/Program Files/WiX Toolset v7.0/bin/wix.exe'
 $uvVersion = '0.13.8'
-$uvArchiveHash = '529E78A9CEC6CD7E3E014F7ECD8BDA0C113969D4ED0F2EFEEDB85C30943325B8'
-$uvArchiveName = 'uv-x86_64-pc-windows-msvc.zip'
-$uvArchiveUrl = "https://github.com/astral-sh/uv/releases/download/$uvVersion/$uvArchiveName"
+$uvExecutableHash = '03FA174894B9D0CBE08762D40D1C2C64D10E875BD56F1A1E334EE1E00D60CDBE'
 
 & (Join-Path $projectRoot 'verify.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Project verification failed; installer was not built.' }
@@ -26,19 +23,22 @@ if (-not (Test-Path -LiteralPath $wixExe -PathType Leaf)) {
     throw "WiX Toolset v7 was not found: $wixExe"
 }
 
-New-Item -ItemType Directory -Force -Path $payloadRoot,$downloads,$artifactRoot,$cacheRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $payloadRoot,$artifactRoot,$cacheRoot | Out-Null
 $rootFiles = @(
-    'README.md', 'VERIFICATION.txt', 'launch-workbench.cmd',
+    'README.md', 'VERIFICATION.txt', 'launch-workbench.cmd', '一键启动.cmd',
+    '后台运行.vbs', '打开工作台.vbs',
+    'updater.py', 'update-and-start.ps1', '更新并启动.cmd', 'log_store.py',
     'install.ps1', 'install_astrbot.ps1', 'install_larkagentx.ps1',
     'install_snowluma.ps1', 'start_snowluma.ps1', 'start-workbench.ps1',
-    'stop-workbench.ps1', 'workbench_server.py', 'workbench.settings.example.json'
+    'stop-workbench.ps1', 'background_runtime.py', 'background_supervisor.py', 'astrbot_runner.py',
+    'workbench_server.py', 'workbench.settings.example.json'
 )
 foreach ($file in $rootFiles) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $payloadRoot $file)
 }
 Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $payloadRoot 'mover-v2-launcher.exe')
 
-foreach ($directory in @('astrbot_plugin_message_bridge', 'workbench')) {
+foreach ($directory in @('astrbot_plugin_message_bridge', 'workbench', 'vendor')) {
     $source = Join-Path $projectRoot $directory
     $destination = Join-Path $payloadRoot $directory
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
@@ -69,47 +69,36 @@ if (@($ruleTemplate.rules).Count -ne 0) {
 }
 Write-Output '[2/5] Application source staged; local QQ/Feishu login data and mappings are excluded.'
 
-$uvZip = Join-Path $downloads $uvArchiveName
-$cachedUvZip = Join-Path $cacheRoot $uvArchiveName
-if (-not (Test-Path -LiteralPath $cachedUvZip -PathType Leaf)) {
-    $previousBuilds = Get-ChildItem -LiteralPath $artifactRoot -Directory -Filter '.installer-build-*' -ErrorAction SilentlyContinue
-    $previousArchive = $previousBuilds | ForEach-Object { Join-Path (Join-Path $_.FullName 'downloads') $uvArchiveName } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if ($previousArchive) {
-        Copy-Item -LiteralPath $previousArchive -Destination $cachedUvZip
-    }
-    else {
-        Write-Output '[3/5] Downloading the official uv package (15 MB) for the installer.'
-        & curl.exe -fLsS --retry 2 --connect-timeout 15 --max-time 180 -o $cachedUvZip $uvArchiveUrl
-        if ($LASTEXITCODE -ne 0) { throw "Official uv download failed (curl exit $LASTEXITCODE)." }
-    }
-}
-$cachedUvHash = (Get-FileHash -LiteralPath $cachedUvZip -Algorithm SHA256).Hash
-if ($cachedUvHash -ne $uvArchiveHash) { throw "uv cache SHA-256 mismatch: $cachedUvHash" }
-Copy-Item -LiteralPath $cachedUvZip -Destination $uvZip -Force
-$actualUvHash = (Get-FileHash -LiteralPath $uvZip -Algorithm SHA256).Hash
-if ($actualUvHash -ne $uvArchiveHash) { throw "uv archive SHA-256 mismatch: $actualUvHash" }
-$uvExtract = Join-Path $downloads 'uv-extract'
-Expand-Archive -LiteralPath $uvZip -DestinationPath $uvExtract
-$uvSource = Get-ChildItem -LiteralPath $uvExtract -Filter 'uv.exe' -Recurse -File | Select-Object -First 1
-if (-not $uvSource) { throw 'Verified uv archive did not contain uv.exe.' }
+# build-portable.ps1 has already verified the pinned uv executable. Reuse
+# that exact output rather than downloading or trusting another archive cache.
+$actualUvHash = (Get-FileHash -LiteralPath $portableUv -Algorithm SHA256).Hash
+if ($actualUvHash -ne $uvExecutableHash) { throw "uv executable SHA-256 mismatch: $actualUvHash" }
 $tools = Join-Path $payloadRoot 'tools'
 New-Item -ItemType Directory -Force -Path $tools | Out-Null
 $bundledUv = Join-Path $tools 'uv.exe'
-Copy-Item -LiteralPath $uvSource.FullName -Destination $bundledUv
+Copy-Item -LiteralPath $portableUv -Destination $bundledUv
 $uvVersionOutput = (& $bundledUv --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $uvVersionOutput -notmatch "^uv $([regex]::Escape($uvVersion)) ") {
     throw "Bundled uv version check failed: $uvVersionOutput"
 }
-
+Write-Output '[3/5] Verified pinned uv executable staged from portable build.'
 foreach ($license in @('LICENSE-APACHE', 'LICENSE-MIT')) {
-    Write-Output "[4/5] Retrieving uv $license notice."
-    $uri = "https://api.github.com/repos/astral-sh/uv/contents/$license"
-    $response = Invoke-RestMethod -Uri $uri -Headers @{ 'User-Agent' = 'MoverV2-Installer' } -TimeoutSec 30
-    if (-not $response.content) { throw "Could not retrieve the uv $license notice." }
-    $bytes = [Convert]::FromBase64String(($response.content -replace '\s', ''))
-    [System.IO.File]::WriteAllBytes((Join-Path $tools "$license.txt"), $bytes)
+    $notice = Join-Path (Split-Path $portableUv -Parent) "$license.txt"
+    if (-not (Test-Path -LiteralPath $notice -PathType Leaf)) { throw "Missing uv $license notice." }
+    Copy-Item -LiteralPath $notice -Destination (Join-Path $tools "$license.txt")
 }
+Write-Output '[4/5] uv license notices staged from portable build.'
+
+$manifestPython = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe'
+$manifestPythonArgs = @()
+if (-not (Test-Path -LiteralPath $manifestPython -PathType Leaf)) {
+    $pythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if (-not $pythonLauncher) { throw 'Installer build requires the project Python runtime or py.exe.' }
+    $manifestPython = $pythonLauncher.Source
+    $manifestPythonArgs = @('-3')
+}
+& $manifestPython @manifestPythonArgs -B (Join-Path $projectRoot 'updater.py') manifest $payloadRoot --version 2.0.9
+if ($LASTEXITCODE -ne 0) { throw 'Could not seal the installer application payload.' }
 
 $extensions = (& $wixExe extension list -g | Out-String)
 if ($extensions -notmatch 'WixToolset\.BootstrapperApplications\.wixext\s+7\.0\.1') {
@@ -249,5 +238,5 @@ $installerHash = (Get-FileHash -LiteralPath $finalPath -Algorithm SHA256).Hash
     SizeBytes = (Get-Item -LiteralPath $finalPath).Length
     SHA256 = $installerHash
     BundledUv = $uvVersionOutput
-    VerifiedUvArchiveSHA256 = $actualUvHash
+    VerifiedUvExecutableSHA256 = $actualUvHash
 } | Format-List

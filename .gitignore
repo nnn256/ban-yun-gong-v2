@@ -12,3 +12,12 @@ cmd_config.json
 onebot.json
 bridge_rules.json
 *.dpapi
+logs/
+.env
+.env.*
+*.log
+*.pid
+*.db
+*.sqlite
+*.sqlite3
+release-manifest.json

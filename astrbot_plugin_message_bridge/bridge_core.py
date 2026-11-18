@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from copy import copy
 from dataclasses import dataclass
 from hashlib import sha256
 from time import monotonic
@@ -96,8 +95,7 @@ def valid_umo(value: str) -> bool:
 
 
 def component_content_type(component: Any) -> str:
-    """Classify AstrBot components for per-route content filtering."""
-    hint = getattr(component, "_mover_content_type", "")
+    hint = getattr(component, "mover_content_type", "") or getattr(component, "_mover_content_type", "")
     if hint in CONTENT_TYPE_ORDER:
         return hint
     name = type(component).__name__.lower()
@@ -112,8 +110,7 @@ def component_content_type(component: Any) -> str:
     if name == "image":
         return "image"
     if name == "file":
-        filename = str(getattr(component, "name", "") or getattr(component, "file", "") or "")
-        filename = filename.split("?", 1)[0].split("#", 1)[0].lower()
+        filename = str(getattr(component, "name", "") or getattr(component, "file", "") or "").split("?", 1)[0].lower()
         suffix = filename.rsplit(".", 1)[-1] if "." in filename else ""
         if suffix in {"mp4", "m4v", "mov", "webm", "mkv", "avi", "3gp", "flv", "wmv"}:
             return "video"
@@ -124,27 +121,14 @@ def component_content_type(component: Any) -> str:
 
 
 def filter_message_chain(chain: Any, content_types: tuple[str, ...] | list[str] | set[str]) -> Any:
-    allowed = frozenset(content_types)
+    from copy import copy
     filtered = copy(chain)
-    filtered.chain = [
-        component for component in getattr(chain, "chain", [])
-        if component_content_type(component) in allowed
-    ]
+    filtered.chain = [component for component in getattr(chain, "chain", []) if component_content_type(component) in frozenset(content_types)]
     return filtered
 
 
 def route_event_key(event_key: str, route: Route) -> str:
-    """Deduplicate each destination independently so one failed route can retry."""
-    material = "\0".join((
-        event_key,
-        route.source_platform,
-        route.source_platform_id,
-        route.source_account_id,
-        route.source_message_type,
-        route.source_session_id,
-        route.target_account_id,
-        route.target_umo,
-    ))
+    material = "\0".join((event_key, route.source_platform, route.source_platform_id, route.source_account_id, route.source_message_type, route.source_session_id, route.target_account_id, route.target_umo))
     return sha256(material.encode("utf-8", errors="replace")).hexdigest()
 
 

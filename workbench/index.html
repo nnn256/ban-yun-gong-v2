@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="zh-CN" data-workbench-ui="20261116-group-name-13">
+<html lang="zh-CN" data-workbench-ui="20261118-mapping-17">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f4f6f4">
     <title>搬运工V2 工作台</title>
-    <link rel="stylesheet" href="/assets/style.css?v=20261116-group-name-13">
-    <script defer src="/assets/app.js?v=20261116-group-name-13"></script>
+    <link rel="stylesheet" href="/assets/style.css?v=20261118-mapping-17">
+    <script defer src="/assets/app.js?v=20261118-mapping-17"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -107,14 +107,26 @@
             <div class="lower-grid">
               <section class="log-section" aria-labelledby="logTitle">
                 <div class="section-heading compact-heading">
-                  <div><p class="eyebrow">LATEST ACTIVITY</p><h2 id="logTitle">运行日志</h2></div>
+                  <div><p class="eyebrow">LIVE ACTIVITY</p><h2 id="logTitle">实时日志与查询</h2></div>
                   <button id="refreshButton" class="icon-button" type="button" title="刷新状态" aria-label="刷新状态"><span aria-hidden="true">↻</span></button>
                 </div>
-                <div id="logList" class="log-list"><p class="empty-inline">AstrBot 启动后会在这里显示最近日志。</p></div>
+                <form id="logQuery" class="log-filters">
+                  <label>组件<select id="logComponent"><option value="all">全部组件</option><option value="bridge">转发插件</option><option value="astrbot">AstrBot</option><option value="snowluma">SnowLuma</option><option value="feishu">飞书连接</option><option value="supervisor">后台守护</option><option value="workbench">工作台</option><option value="bootstrap">启动配置</option></select></label>
+                  <label>级别<select id="logLevel"><option value="all">全部级别</option><option value="INFO">信息</option><option value="WARNING">警告</option><option value="ERROR">错误</option><option value="DEBUG">调试</option></select></label>
+                  <label>关键词<input id="logSearch" type="search" placeholder="查找错误、事件或会话 ID"></label>
+                  <label>日志文件<select id="logFile"><option value="">所有组件最新日志</option></select></label>
+                  <label>开始时间<input id="logSince" type="datetime-local"></label><label>结束时间<input id="logUntil" type="datetime-local"></label>
+                  <button class="button button-quiet button-small" type="submit">查询</button>
+                  <label class="log-live"><input id="logLive" type="checkbox" checked>实时刷新</label>
+                  <button id="exportLogs" class="button button-quiet button-small" type="button">导出当前结果</button>
+                  <button id="olderLogs" class="button button-quiet button-small" type="button" disabled>更早日志</button>
+                </form>
+                <p id="logQueryStatus" class="section-note" role="status">正在读取日志…</p>
+                <div id="logList" class="log-list" aria-live="off"><p class="empty-inline">等待组件输出日志。</p></div>
               </section>
               <section class="guardrail-section" aria-labelledby="guardrailTitle">
                 <div class="guardrail-icon" aria-hidden="true">✓</div>
-              <div><p class="eyebrow">RUNTIME MODE</p><h2 id="guardrailTitle">LarkAgentX 不启动 coding agent</h2><p>LarkAgentX agent backend 固定为 none。消息映射独立转发；AstrBot 是否生成回复由其模型与机器人设置决定。</p></div>
+              <div><p class="eyebrow">BACKGROUND</p><h2 id="guardrailTitle">后台持续监控</h2><p id="backgroundSummary">正在读取后台守护状态。</p><p>关闭浏览器、锁屏和显示器息屏均可继续转发。系统睡眠、关机或网络断开会中断连接。</p></div>
               </section>
             </div>
 
@@ -173,10 +185,20 @@
               <button id="saveRules" class="button button-outline" type="button">保存映射</button>
             </div>
             <div id="rulesTable" class="rules-table-wrap"></div>
-            <p class="rules-hint">修改后选择“保存映射”。已运行的桥接插件会热更新映射，无需重载插件或重启 AstrBot。</p>
+            <p class="rules-hint">列表中的“转发本人”按方向立即保存；启停或删除后请点“保存映射”。保存后无需重启。</p>
           </section>
 
           <section class="view" id="page-settings" aria-labelledby="settingsTitle" hidden>
+            <section class="settings-card background-card" aria-labelledby="backgroundTitle">
+              <h2 id="backgroundTitle">后台保活</h2>
+              <p id="backgroundDetail" class="page-subtitle">工作台与 AstrBot 异常退出后按退避策略恢复；扫码等待不会触发重启。</p>
+              <form id="backgroundForm" class="background-options">
+                <label><input id="backgroundEnabled" type="checkbox">启用后台自动恢复</label>
+                <label><input id="backgroundSleep" type="checkbox">运行期间阻止系统空闲睡眠（允许息屏）</label>
+                <label><input id="backgroundAutostart" type="checkbox">Windows 登录后自动运行</label>
+                <button type="submit" class="button button-primary button-small">保存后台设置</button>
+              </form>
+            </section>
             <div class="page-heading">
               <div><p class="eyebrow">LOCAL INSTANCE</p><h1 id="settingsTitle">本地设置</h1><p class="page-subtitle">工作台与 AstrBot 的本机目录和管理端口。</p></div>
             </div>
@@ -209,8 +231,8 @@
 
     <dialog id="mappingDialog" class="mapping-dialog">
       <form id="mappingForm" method="dialog">
-        <div class="dialog-heading"><div><p class="eyebrow">NEW ROUTE</p><h2>新增群映射</h2></div><button id="closeDialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
-        <p class="dialog-intro">来源和目标独立选择 QQ 或飞书，支持 QQ → QQ、飞书 → 飞书及跨平台。选择双向会建立两条独立规则。</p>
+        <div class="dialog-heading"><div><p class="eyebrow">MESSAGE ROUTE</p><h2 id="mappingDialogTitle">新增群映射</h2></div><button id="closeDialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
+        <p class="dialog-intro">来源和目标可独立选择 QQ 或飞书；双向规则会建立两个方向。</p>
         <div class="mapping-discovery-toolbar"><div><strong>自动读取账号与群列表</strong><p id="mappingDiscoveryStatus" role="status">打开时将读取当前账号可验证的群与已观察会话。</p></div><button id="refreshMappingDiscovery" class="button button-outline button-small" type="button">自动读取</button></div>
         <div class="pair-grid">
           <fieldset>
@@ -234,12 +256,23 @@
           </fieldset>
         </div>
         <p id="mappingDiscoveryWarnings" class="mapping-discovery-warnings" hidden></p>
+        <fieldset id="contentTypeOptions" class="content-type-fieldset">
+          <legend>转发内容类型</legend>
+          <div class="content-type-options">
+            <label><input type="checkbox" name="contentType" value="text" checked>文字</label>
+            <label><input type="checkbox" name="contentType" value="emoji" checked>表情包</label>
+            <label><input type="checkbox" name="contentType" value="image" checked>图片</label>
+            <label><input type="checkbox" name="contentType" value="video" checked>视频</label>
+            <label><input type="checkbox" name="contentType" value="audio" checked>语音</label>
+            <label><input type="checkbox" name="contentType" value="file" checked>文件</label>
+          </div>
+        </fieldset>
         <label class="field-label" for="mappingDirection">转发方向</label>
         <select id="mappingDirection"><option value="both">双向</option><option value="forward">单向：来源 → 目标</option></select>
         <label class="include-self-option"><input id="mappingIncludeSelf" type="checkbox">转发本人手动发送的消息（默认关闭）</label>
-        <p class="field-help">桥接自己发出的消息回声始终过滤，避免循环。</p>
+        <p class="field-help">保存后对所选方向生效。双向设置不同时显示为半选。桥接发出的消息不会再次转发。</p>
         <div id="dialogError" class="inline-error" role="alert" hidden></div>
-        <div class="dialog-actions"><button id="cancelDialog" class="button button-quiet" type="button">取消</button><button class="button button-primary" type="submit">创建映射</button></div>
+        <div class="dialog-actions"><button id="cancelDialog" class="button button-quiet" type="button">取消</button><button id="submitMapping" class="button button-primary" type="submit">创建映射</button></div>
       </form>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

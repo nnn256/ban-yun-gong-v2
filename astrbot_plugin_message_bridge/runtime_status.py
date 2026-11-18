@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .event_log import EventLog
+from .snowluma_watchdog import SnowLumaRecovery
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -21,10 +24,12 @@ class RuntimeStatus:
     def __init__(self, context: Any, directory: Path, larkx: Any, *, interval: float = 7, timeout: float = 3) -> None:
         self.context = context
         self.path = Path(directory) / "current_runtime_status.json"
+        self.events = EventLog(Path(directory))
         self.larkx = larkx
         self.interval = interval
         self.timeout = timeout
         self._task: asyncio.Task | None = None
+        self._snowluma_recovery: SnowLumaRecovery | None = None
         self._lock = threading.RLock()
         self._activity = {
             platform: {"received_count": 0, "last_received_at": "", "last_chat_id": "",
@@ -77,22 +82,30 @@ class RuntimeStatus:
             activity = self._activity[platform]
             activity.update(received_count=activity["received_count"] + 1,
                             last_received_at=utc_now(), last_chat_id=text(chat_id))
+            self.events.write("receive", platform, chat_id=chat_id)
             self._write()
 
     def update_feishu(self) -> None:
         with self._lock:
-            self._state["feishu"] = self._feishu()
+            current = self._feishu()
+            if current.get("state") != self._state.get("feishu", {}).get("state"):
+                self.events.write("connection", "feishu", state=current.get("state"))
+            self._state["feishu"] = current
             self._write()
 
     def update_routing(self, enabled: bool, total: int, active: int) -> None:
         with self._lock:
-            self._state["routing"] = {"enabled": bool(enabled), "total": max(0, int(total)), "active": max(0, int(active))}
+            routing = {"enabled": bool(enabled), "total": max(0, int(total)), "active": max(0, int(active))}
+            if routing != self._state.get("routing"):
+                self.events.write("rules", **routing)
+            self._state["routing"] = routing
             self._write()
 
     def record_delivery(self, platform: str, success: bool, message_id: str = "") -> None:
         if platform not in self._activity:
             return
         with self._lock:
+            self.events.write("send_accepted" if success else "send_failed", platform, success, message_id=message_id)
             activity = self._activity[platform]
             if success:
                 # Both transport adapters currently return an acceptance bool.
@@ -119,6 +132,7 @@ class RuntimeStatus:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        await self._close_snowluma_recovery()
         with self._lock:
             self._state["qq"].update(state="stopped", connected=False, identity_verified=False, accounts=[])
             self._state["feishu"].update(state="stopped", connected=False, identity_verified=False)
@@ -143,7 +157,11 @@ class RuntimeStatus:
     async def refresh(self) -> dict:
         qq, snow = await asyncio.gather(self._qq(), self._snowluma())
         with self._lock:
-            self._state.update(qq=qq, feishu=self._feishu(), snowluma=snow)
+            current = {"qq": qq, "feishu": self._feishu(), "snowluma": snow}
+            for name, value in current.items():
+                if value.get("state") != self._state.get(name, {}).get("state") or value.get("running") != self._state.get(name, {}).get("running"):
+                    self.events.write("connection", name, state=value.get("state"))
+            self._state.update(current)
             self._write()
             return json.loads(json.dumps(self._state))
 
@@ -212,18 +230,31 @@ class RuntimeStatus:
                 account.update(state="disconnected", connected=False, identity_verified=False, user_id="", nickname="", groups_status="unavailable", groups=[])
         return account
 
+    async def _close_snowluma_recovery(self) -> None:
+        if self._snowluma_recovery is not None:
+            await self._snowluma_recovery.close()
+            self._snowluma_recovery = None
+
     async def _snowluma(self) -> dict:
         getter = getattr(self.context, "get_registered_star", None)
         if not callable(getter):
+            await self._close_snowluma_recovery()
             return self._unknown_snowluma()
         try:
             metadata = getter("pulids_snowluma_go_to_astrbot")
             if metadata is None or getattr(metadata, "activated", True) is False:
+                await self._close_snowluma_recovery()
                 return self._unknown_snowluma()
             plugin = getattr(metadata, "star_cls", None)
             manager = getattr(plugin, "manager", None)
             if manager is None:
+                await self._close_snowluma_recovery()
                 return self._unknown_snowluma()
+            if self._snowluma_recovery is not None and self._snowluma_recovery.manager is not manager:
+                await self._close_snowluma_recovery()
+            if self._snowluma_recovery is None and SnowLumaRecovery.can_attach(manager):
+                self._snowluma_recovery = SnowLumaRecovery(manager, self.events)
+                self._snowluma_recovery.start()
             # Use the manager already owned by AstrBot. Do not request a WebUI
             # token, read configuration, or proxy its unrestricted status JSON.
             raw = await asyncio.wait_for(manager.status(), self.timeout)

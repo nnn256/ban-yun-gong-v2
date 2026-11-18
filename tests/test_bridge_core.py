@@ -5,7 +5,10 @@ from astrbot_plugin_message_bridge.bridge_core import (
     BridgeRouter,
     SeenEvents,
     SentMessageIds,
+    component_content_type,
+    filter_message_chain,
     make_event_key,
+    route_event_key,
     valid_umo,
 )
 
@@ -127,6 +130,41 @@ class RouterTests(unittest.TestCase):
         self.assertFalse(valid_umo("larkx:GroupMessage:"))
         self.assertFalse(valid_umo("larkx:Unknown:oc_123"))
 
+    def test_route_content_types_default_to_all_and_custom_selection_roundtrips(self):
+        self.assertEqual(BridgeRouter(self.config).routes[0].content_types, ("text", "emoji", "image", "video", "audio", "file"))
+        self.config["rules"][0]["content_types"] = ["audio", "text"]
+        route = BridgeRouter(self.config).routes[0]
+        self.assertEqual(route.content_types, ("text", "audio"))
+
+    def test_content_filter_keeps_only_selected_component_types(self):
+        class Plain:
+            pass
+
+        class Face:
+            pass
+
+        class Record:
+            pass
+
+        class Video:
+            pass
+
+        class File:
+            name = "notes.txt"
+
+        class Chain:
+            chain = [Plain(), Face(), Record(), Video(), File()]
+
+        filtered = filter_message_chain(Chain(), ("text", "audio", "video"))
+        self.assertEqual([component_content_type(item) for item in filtered.chain], ["text", "audio", "video"])
+        self.assertEqual(len(Chain.chain), 5)
+
+    def test_route_event_keys_are_independent_per_destination(self):
+        router = BridgeRouter(self.config)
+        first, second = router.routes
+        key = make_event_key("qq", "10001", "message", "member", "hello", 1)
+        self.assertNotEqual(route_event_key(key, first), route_event_key(key, second))
+
 
 class LoopProtectionTests(unittest.TestCase):
     def test_sent_qq_receipt_is_shared_only_within_the_target_group(self):
@@ -148,6 +186,12 @@ class LoopProtectionTests(unittest.TestCase):
         seen.accept("three", now=3)
         self.assertEqual(len(seen._seen), 2)
         self.assertTrue(seen.accept("one", now=4))
+
+    def test_failed_delivery_can_release_its_deduplication_key_for_retry(self):
+        seen = SeenEvents()
+        self.assertTrue(seen.accept("route-event"))
+        seen.discard("route-event")
+        self.assertTrue(seen.accept("route-event"))
 
     def test_fallback_event_key_is_stable(self):
         first = make_event_key("qq", "10001", "", "user", "hello", 50)

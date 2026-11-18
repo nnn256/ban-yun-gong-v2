@@ -19,7 +19,14 @@ $relativeFiles = @(
     'README.md',
     'VERIFICATION.txt',
     'launch-workbench.cmd',
+    '一键启动.cmd',
+    '后台运行.vbs',
+    '打开工作台.vbs',
     'build-portable.ps1',
+    'updater.py',
+    'update-and-start.ps1',
+    '更新并启动.cmd',
+    'log_store.py',
     'portable_launcher.cs',
     'install.ps1',
     'install_astrbot.ps1',
@@ -30,6 +37,9 @@ $relativeFiles = @(
     'stop-workbench.ps1',
     'verify.ps1',
     'package.ps1',
+    'background_runtime.py',
+    'background_supervisor.py',
+    'astrbot_runner.py',
     'workbench_server.py',
     'workbench.settings.example.json'
 )
@@ -37,6 +47,7 @@ $sourceDirs = @(
     (Join-Path $projectRoot 'astrbot_plugin_message_bridge'),
     (Join-Path $projectRoot 'tests'),
     (Join-Path $projectRoot 'workbench'),
+    (Join-Path $projectRoot 'vendor'),
     (Join-Path $projectRoot 'installer')
 )
 
@@ -65,6 +76,7 @@ try {
     }
     $portableEntries = @(
         @{ Path = $portableExe; Entry = '搬运工V2.exe' },
+        @{ Path = $portableExe; Entry = 'mover-v2-launcher.exe' },
         @{ Path = $portableUv; Entry = 'tools/uv.exe' },
         @{ Path = (Join-Path (Split-Path $portableUv -Parent) 'LICENSE-APACHE.txt'); Entry = 'tools/LICENSE-APACHE.txt' },
         @{ Path = (Join-Path (Split-Path $portableUv -Parent) 'LICENSE-MIT.txt'); Entry = 'tools/LICENSE-MIT.txt' }
@@ -82,9 +94,20 @@ finally {
     $zip.Dispose()
 }
 
+$manifestPython = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe'
+$manifestPythonArgs = @()
+if (-not (Test-Path -LiteralPath $manifestPython -PathType Leaf)) {
+    $pythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if (-not $pythonLauncher) { throw 'Packaging requires the project Python runtime or py.exe to seal the release manifest.' }
+    $manifestPython = $pythonLauncher.Source
+    $manifestPythonArgs = @('-3')
+}
+& $manifestPython @manifestPythonArgs -B (Join-Path $projectRoot 'updater.py') seal $tempArchive --version 2.0.9
+if ($LASTEXITCODE -ne 0) { throw 'Could not seal the exact release ZIP payload.' }
+
 $check = [System.IO.Compression.ZipFile]::OpenRead($tempArchive)
 try {
-    $expectedEntries = $relativeFiles.Count + $portableEntries.Count
+    $expectedEntries = $relativeFiles.Count + $portableEntries.Count + 1
     if ($check.Entries.Count -ne $expectedEntries) {
         throw "Archive entry count mismatch: expected $expectedEntries, got $($check.Entries.Count)"
     }

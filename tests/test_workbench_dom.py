@@ -12,6 +12,9 @@ class WorkbenchMarkup(HTMLParser):
         self.ids = []
         self.ui_version = None
         self.assets = []
+        self.content_types = []
+        self.content_labels = []
+        self._current_content_type = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -21,6 +24,17 @@ class WorkbenchMarkup(HTMLParser):
             self.ui_version = attrs.get("data-workbench-ui")
         if tag in {"script", "link"}:
             self.assets.append(attrs.get("src") or attrs.get("href") or "")
+        if tag == "input" and attrs.get("name") == "contentType":
+            self.content_types.append(attrs)
+            self._current_content_type = attrs.get("value")
+
+    def handle_data(self, data):
+        if self._current_content_type and data.strip():
+            self.content_labels.append((self._current_content_type, data.strip()))
+
+    def handle_endtag(self, tag):
+        if tag == "label":
+            self._current_content_type = None
 
 
 class WorkbenchDomContractTests(unittest.TestCase):
@@ -53,9 +67,19 @@ class WorkbenchDomContractTests(unittest.TestCase):
         self.assertIn('id="mappingIncludeSelf" type="checkbox"', self.html)
         self.assertIn("本人手动发送的消息（默认关闭）", self.html)
         self.assertIn("data-toggle-self", self.javascript)
-        self.assertIn("function buildRouteFromEndpoints(source, target, includeSelf = false)", self.javascript)
 
-    def test_generic_endpoints_filter_accounts_search_names_and_build_all_platform_pairs(self):
+    def test_content_type_controls_have_supported_labels_and_all_defaults(self):
+        expected = [("text", "文字"), ("emoji", "表情包"), ("image", "图片"),
+                    ("video", "视频"), ("audio", "语音"), ("file", "文件")]
+        self.assertIn("contentTypeOptions", self.markup.ids)
+        self.assertEqual(self.markup.content_labels, expected)
+        self.assertEqual([field.get("value") for field in self.markup.content_types],
+                         [kind for kind, _ in expected])
+        self.assertTrue(all(field.get("type") == "checkbox" and "checked" in field
+                            for field in self.markup.content_types))
+        self.assertIn("至少选择一种转发内容类型。", self.javascript)
+
+    def test_endpoint_selection_content_filters_and_editor_state(self):
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node.js is not installed")

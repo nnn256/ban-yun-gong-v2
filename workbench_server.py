@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ipaddress
+import hashlib
 import os
 import re
 import secrets
@@ -11,13 +12,22 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
-from astrbot_plugin_message_bridge.bridge_core import BridgeRouter, valid_umo
+from log_store import append_log, query_logs, redact
+import background_runtime
+
+from astrbot_plugin_message_bridge.bridge_core import (
+    BridgeRouter,
+    CONTENT_TYPE_ORDER,
+    DEFAULT_CONTENT_TYPES,
+    valid_umo,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +45,7 @@ LARKX_SOURCE = RUNTIME_DIR / "LarkAgentX-runtime" / "LarkAgentX-d288ef4df8a42f62
 LARKX_HOME = RUNTIME_DIR / "LarkAgentX-data"
 BOOTSTRAP_SECRET_FILE = RUNTIME_DIR / "AstrBot" / ".workbench-bootstrap.dpapi"
 ASTRBOT_PID_FILE = RUNTIME_DIR / "AstrBot" / ".mover-v2-astrbot.pid"
+ASTRBOT_RUNNER = ROOT / "astrbot_runner.py"
 PLUGIN_NAME = "astrbot_plugin_message_bridge"
 PLUGIN_FILES = (
     "__init__.py",
@@ -42,9 +53,13 @@ PLUGIN_FILES = (
     "bridge_rules.example.json",
     "larkx_bridge.py",
     "larkx_media.py",
+    "larkx_merge.py",
+    "larkx_richtext.py",
     "qq_emojis.py",
     "qq_transport.py",
     "runtime_status.py",
+    "snowluma_watchdog.py",
+    "event_log.py",
     "main.py",
     "metadata.yaml",
 )
@@ -57,6 +72,9 @@ MESSAGE_TYPES = {"GroupMessage", "FriendMessage"}
 INITIAL_PASSWORD_RE = re.compile(r"Initial password:\s*(\S+)", re.IGNORECASE)
 
 _runtime_lock = threading.Lock()
+_astrbot_start_lock = threading.Lock()
+_settings_lock = threading.RLock()
+_rules_lock = threading.Lock()
 _astrbot_process: subprocess.Popen[str] | None = None
 _snowluma_process: subprocess.Popen[str] | None = None
 _larkx_qr_lock = threading.Lock()
@@ -296,14 +314,35 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def load_settings() -> dict[str, Any]:
-    if not SETTINGS_FILE.exists():
-        _atomic_json(SETTINGS_FILE, DEFAULT_SETTINGS)
-    try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    root = str(data.get("astrbot_root", DEFAULT_SETTINGS["astrbot_root"])).strip()
-    port = data.get("astrbot_port", DEFAULT_SETTINGS["astrbot_port"])
+    def initialized(value: str | Path, *, require_plugins: bool = False) -> bool:
+        if not str(value).strip():
+            return False
+        try:
+            candidate = Path(value).expanduser().resolve()
+            return (candidate / ".astrbot").is_file() and (
+                not require_plugins or (candidate / "data" / "plugins").is_dir()
+            )
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    with _settings_lock:
+        if not SETTINGS_FILE.exists():
+            _atomic_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        root = str(data.get("astrbot_root", DEFAULT_SETTINGS["astrbot_root"])).strip()
+        local_root = ROOT / "runtime" / "AstrBot"
+        # A relocated source tree can retain a deleted extraction directory.
+        # Recover only to this installation's initialized runtime, never by
+        # searching the machine or overriding a valid custom runtime.
+        if "astrbot_root" in data and not initialized(root) and initialized(local_root, require_plugins=True):
+            root = str(local_root.resolve())
+            _atomic_json(SETTINGS_FILE, {**data, "astrbot_root": root})
+        port = data.get("astrbot_port", DEFAULT_SETTINGS["astrbot_port"])
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -319,6 +358,81 @@ def astrbot_root(settings: dict[str, Any] | None = None) -> Path:
 
 def plugin_destination(root: Path) -> Path:
     return root / "data" / "plugins" / PLUGIN_NAME
+
+
+def prepare_local_setup() -> dict[str, Any]:
+    """Prepare this install without starting processes or changing login state."""
+    root = astrbot_root()
+    if not (root / ".astrbot").is_file() or not (root / "data" / "plugins").is_dir():
+        raise ValueError("AstrBot 目录未初始化，请运行一键启动.cmd 自动修复")
+    previous_bridge = plugin_destination(root) / "main.py"
+    bridge_changed = not previous_bridge.is_file() or any(
+        not (plugin_destination(root) / name).is_file()
+        or (plugin_destination(root) / name).read_bytes() != (PLUGIN_SOURCE / name).read_bytes()
+        for name in PLUGIN_FILES
+    )
+    install_plugin(root)
+    snow_name = "pulids_snowluma_go_to_astrbot"
+    snow_plugin = root / "data" / "plugins" / snow_name
+    snow_added = not (snow_plugin / "metadata.yaml").is_file()
+    if snow_added:
+        archive = ROOT / "vendor" / "snowluma-go-1.0.9.zip"
+        expected = "176edc48c44ee736504679f187c74de23219ba769a34dbcbaf996ecc17615fc4"
+        if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+            raise ValueError("SnowLuma Go 插件包缺失或校验失败，请重新解压完整安装包")
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix=".snow-plugin-", dir=root / "data" / "plugins") as folder:
+            stage = Path(folder)
+            with zipfile.ZipFile(archive) as bundle:
+                for entry in bundle.infolist():
+                    target = (stage / entry.filename).resolve()
+                    if not target.is_relative_to(stage.resolve()):
+                        raise ValueError("SnowLuma Go 插件包路径无效")
+                bundle.extractall(stage)
+            if not (stage / "main.py").is_file() or not (stage / "LICENSE").is_file():
+                raise ValueError("SnowLuma Go 插件包不完整")
+            snow_plugin.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(stage, snow_plugin, dirs_exist_ok=True)
+
+    config_path = root / "data" / "cmd_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8-sig")) if config_path.exists() else {}
+    if not isinstance(config, dict) or not isinstance(config.get("platform", []), list):
+        raise ValueError("AstrBot 平台配置格式无效，已保留原文件")
+    platforms = config.setdefault("platform", [])
+    qq_added = not any(isinstance(item, dict) and item.get("id") == "qq_bridge" for item in platforms)
+    if qq_added:
+        platforms.append({"id": "qq_bridge", "type": "aiocqhttp", "enable": True,
+                          "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 6199, "ws_reverse_token": ""})
+        if config_path.exists():
+            shutil.copy2(config_path, config_path.with_name(f"cmd_config.pre-bootstrap-{time.time_ns()}.json"))
+        _atomic_json(config_path, config)
+
+    snow_config_path = root / "data" / "config" / f"{snow_name}_config.json"
+    if not snow_config_path.exists():
+        _atomic_json(snow_config_path, {"deploy_mode": "native", "auto_start": True,
+                                      "auto_sync": True, "auto_hook": True, "auto_start_qq": True,
+                                      "snowluma_port": 5099, "webui_bind_host": "127.0.0.1"})
+    # Seed the manager-owned runtime, not a second unmanaged SnowLuma copy.
+    snow_root = root / "data" / "plugin_data" / snow_name / "snowluma"
+    onebot_path = snow_root / "config" / "onebot.json"
+    onebot = json.loads(onebot_path.read_text(encoding="utf-8-sig")) if onebot_path.exists() else {}
+    if not isinstance(onebot, dict):
+        raise ValueError("SnowLuma 配置格式无效，已保留原文件")
+    previous = json.dumps(onebot, sort_keys=True)
+    _snowluma_ws_client_config(onebot)
+    onebot_changed = json.dumps(onebot, sort_keys=True) != previous
+    if onebot_changed:
+        if onebot_path.exists():
+            shutil.copy2(onebot_path, onebot_path.with_name(f"onebot.pre-bootstrap-{time.time_ns()}.json"))
+        _atomic_json(onebot_path, onebot)
+    account_onebot_changed = _enable_snowluma_account_self_reports(onebot_path.parent)
+    runtime_config = snow_root / "config" / "runtime.json"
+    if not runtime_config.exists():
+        _atomic_json(runtime_config, {"webuiHost": "127.0.0.1", "webuiPort": 5099})
+    return {"astrbot_root": str(root), "snowluma_root": str(snow_root),
+            "snowluma_plugin_installed": snow_added, "qq_platform_added": qq_added,
+            "requires_restart": bridge_changed or snow_added or qq_added or onebot_changed or account_onebot_changed}
 
 
 def rules_path(root: Path) -> Path:
@@ -507,24 +621,43 @@ def _set_astrbot_mobile_listener() -> dict[str, Any]:
 
 
 def _managed_astrbot_pid() -> int | None:
-    with _runtime_lock:
-        process = _astrbot_process
-    if process is not None and process.poll() is None:
-        return process.pid
+    from astrbot_runner import owned_runner, same_process
+
     try:
-        pid = int(ASTRBOT_PID_FILE.read_text(encoding="ascii").strip())
+        marker = json.loads(ASTRBOT_PID_FILE.read_text(encoding="utf-8"))
+        if not isinstance(marker, dict):
+            return None
+        root = astrbot_root()
+        runner_pid = owned_runner(marker, root, ASTRBOT_RUNNER)
+        if runner_pid is not None:
+            return runner_pid
+        # Recover a child if its collector unexpectedly exited. PID plus creation
+        # time and exact command/cwd are all required; never trust a PID alone.
+        if not same_process(marker):
+            return None
         import psutil
 
-        candidate = psutil.Process(pid)
-        command = [str(part).lower() for part in candidate.cmdline()]
-        expected_exe = str(ASTRBOT_EXE).lower()
-        executable = str(candidate.exe()).lower()
-        is_astrbot = executable == expected_exe and "run" in command
-        if is_astrbot:
-            return pid
+        process = psutil.Process(int(marker["pid"]))
+        from astrbot_runner import is_astrbot_command
+
+        if not is_astrbot_command(process.cmdline(), process.exe(), ASTRBOT_EXE):
+            return None
+        if Path(process.cwd()).resolve() == root.resolve():
+            return process.pid
+        # A Windows console-script launcher may have a different cwd from
+        # the interpreter serving AstrBot. Recover the recorded launcher only
+        # when its exact executable and a live AstrBot descendant both match.
+        if Path(process.exe()).resolve() == ASTRBOT_EXE.resolve():
+            for child in process.children(recursive=True):
+                try:
+                    if (Path(child.cwd()).resolve() == root.resolve()
+                            and is_astrbot_command(child.cmdline(), child.exe(), ASTRBOT_EXE)):
+                        return process.pid
+                except (psutil.Error, OSError, ValueError):
+                    continue
+        return None
     except Exception:
-        pass
-    return None
+        return None
 
 
 def install_plugin(root: Path) -> Path:
@@ -583,6 +716,18 @@ def validate_rules(data: dict[str, Any]) -> dict[str, Any]:
         target_account_id = str(raw.get("target_account_id", "")).strip()
         target_umo = str(raw.get("target_umo", "")).strip()
         name = str(raw.get("name", f"映射 {index}")).strip()[:80]
+        raw_content_types = raw.get("content_types")
+        if raw_content_types is None:
+            content_types = list(DEFAULT_CONTENT_TYPES)
+        elif not isinstance(raw_content_types, list):
+            raise ValueError(f"第 {index} 条规则的转发内容类型格式无效")
+        else:
+            unknown_types = [value for value in raw_content_types if value not in CONTENT_TYPE_ORDER]
+            content_types = [kind for kind in CONTENT_TYPE_ORDER if kind in raw_content_types]
+            if unknown_types:
+                raise ValueError(f"第 {index} 条规则包含不支持的转发内容类型")
+            if not content_types:
+                raise ValueError(f"第 {index} 条规则至少选择一种转发内容类型")
         if source_platform not in {"aiocqhttp", "larkx"}:
             raise ValueError(f"第 {index} 条规则的平台必须是 QQ/OneBot 或飞书个人号")
         if not source_platform_id or not source_session_id:
@@ -603,6 +748,7 @@ def validate_rules(data: dict[str, Any]) -> dict[str, Any]:
                 "source_account_id": source_account_id,
                 "target_account_id": target_account_id,
                 "include_self": bool(raw.get("include_self", False)),
+                "content_types": content_types,
                 "source_session_id": source_session_id,
                 "target_umo": target_umo,
             }
@@ -649,23 +795,26 @@ def _write_local_dashboard_config(root: Path, port: int) -> None:
 def _start_output_capture(process: subprocess.Popen[str], log_path: Path) -> None:
     global _initial_password
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
-        stream = process.stdout
-        if stream is None:
-            return
-        for raw_line in stream:
-            line = raw_line.rstrip("\r\n")
-            match = INITIAL_PASSWORD_RE.search(line)
-            if match:
-                with _runtime_lock:
-                    _initial_password = match.group(1)
-                _store_bootstrap_password(match.group(1))
-                line = INITIAL_PASSWORD_RE.sub("Initial password: [在工作台本地显示]", line)
-            log_file.write(line + "\n")
-            log_file.flush()
+    stream = process.stdout
+    if stream is None:
+        return
+    for raw_line in stream:
+        line = raw_line.rstrip("\r\n")
+        match = INITIAL_PASSWORD_RE.search(line)
+        if match:
+            with _runtime_lock:
+                _initial_password = match.group(1)
+            _store_bootstrap_password(match.group(1))
+            line = INITIAL_PASSWORD_RE.sub("Initial password: [在工作台本地显示]", line)
+        append_log(log_path, line)
 
 
 def start_astrbot(reset_password: bool = False) -> dict[str, Any]:
+    with _astrbot_start_lock:
+        return _start_astrbot(reset_password)
+
+
+def _start_astrbot(reset_password: bool) -> dict[str, Any]:
     global _astrbot_process, _initial_password
     settings = load_settings()
     root = astrbot_root(settings)
@@ -673,6 +822,13 @@ def start_astrbot(reset_password: bool = False) -> dict[str, Any]:
         raise ValueError("AstrBot 运行环境未安装；检查 runtime/.venv/Scripts/astrbot.exe")
     if not (root / ".astrbot").is_file():
         raise ValueError("AstrBot 尚未初始化")
+    pending = {"started": True, "already_starting": True, "port": settings["astrbot_port"]}
+    managed_pid = _managed_astrbot_pid()
+    if managed_pid is not None:
+        return {**pending, "pid": managed_pid}
+    with _runtime_lock:
+        if _astrbot_process is not None and _astrbot_process.poll() is None:
+            return pending
     if port_open(settings["astrbot_port"]):
         raise ValueError(f"端口 {settings['astrbot_port']} 已被占用；未启动第二个 AstrBot")
 
@@ -710,30 +866,31 @@ def start_astrbot(reset_password: bool = False) -> dict[str, Any]:
             environment.pop("ASTRBOT_DASHBOARD_INITIAL_PASSWORD", None)
 
     log_path = root / "data" / "logs" / "workbench-astrbot.log"
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if not ASTRBOT_RUNNER.is_file():
+        raise ValueError("独立后台运行模块缺失；请完整解压新版 ZIP")
+    runner_command = [sys.executable, str(ASTRBOT_RUNNER), "--root", str(root),
+                      "--pid-file", str(ASTRBOT_PID_FILE), "--log", str(log_path),
+                      "--secret", str(BOOTSTRAP_SECRET_FILE), "--", *command]
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     process = subprocess.Popen(
-        command,
-        cwd=root,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+        runner_command, cwd=root, env=environment, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=creation_flags,
     )
     with _runtime_lock:
         _astrbot_process = process
-    ASTRBOT_PID_FILE.write_text(str(process.pid), encoding="ascii")
-    threading.Thread(
-        target=_start_output_capture,
-        args=(process, log_path),
-        name="astrbot-log-reader",
-        daemon=True,
-    ).start()
-    return {"started": True, "pid": process.pid, "port": settings["astrbot_port"]}
+    # Give the runner a brief chance to record ownership. On slow Windows
+    # launches the caller can keep polling without sending another start request.
+    from astrbot_runner import launched_by
+
+    for _ in range(80):
+        if process.poll() is not None:
+            raise ValueError("AstrBot 后台启动器退出；请查询 AstrBot 日志")
+        runner_pid = _managed_astrbot_pid()
+        if runner_pid is not None and launched_by(runner_pid, process.pid):
+            return {"started": True, "pid": runner_pid, "port": settings["astrbot_port"]}
+        time.sleep(0.05)
+    return pending
 
 
 def stop_astrbot() -> dict[str, Any]:
@@ -742,19 +899,19 @@ def stop_astrbot() -> dict[str, Any]:
         process = _astrbot_process
     tracked_pid = _managed_astrbot_pid()
     if tracked_pid is not None:
-        import psutil
+        from astrbot_runner import same_process, stop_owned_tree
 
-        managed_process = psutil.Process(tracked_pid)
-        children = managed_process.children(recursive=True)
-        children = [child for child in children if child.pid != os.getpid()]
-        for child in reversed(children):
-            child.terminate()
-        managed_process.terminate()
-        _, alive = psutil.wait_procs([*children, managed_process], timeout=10)
-        for process in alive:
-            process.kill()
-        if alive:
-            psutil.wait_procs(alive, timeout=5)
+        try:
+            marker = json.loads(ASTRBOT_PID_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("AstrBot 进程所有权记录不可用；为避免停止其他程序，未执行强制停止") from exc
+        records = [marker.get("runner"), marker]
+        owner = next((item for item in records if isinstance(item, dict) and item.get("pid") == tracked_pid), None)
+        if owner is None or not same_process(owner):
+            raise ValueError("AstrBot 进程身份已变化；为避免停止 PID 复用后的程序，请重试")
+        stop_owned_tree(int(owner["pid"]), float(owner["process_started_at"]))
+        if same_process(owner):
+            raise ValueError("AstrBot 后台进程未能安全退出；请查看后台运行日志")
     else:
         if port_open(load_settings()["astrbot_port"]):
             raise ValueError("AstrBot 正在运行，但不是由此工作台启动；请在 AstrBot 原控制台关闭")
@@ -793,6 +950,10 @@ def start_snowluma() -> dict[str, Any]:
     return {"started": True, "pid": _snowluma_process.pid, "url": "http://127.0.0.1:5099/"}
 
 
+_MOVER_ONEBOT_NODE = "mover-v2-astrbot"
+_MOVER_ONEBOT_URL = "ws://127.0.0.1:6199/ws"
+
+
 def _snowluma_ws_client_config(config: dict[str, Any]) -> dict[str, Any]:
     networks = config.get("networks")
     if not isinstance(networks, dict):
@@ -803,8 +964,8 @@ def _snowluma_ws_client_config(config: dict[str, Any]) -> dict[str, Any]:
         clients = []
         networks["wsClients"] = clients
 
-    name = "mover-v2-astrbot"
-    target_url = "ws://127.0.0.1:6199/ws"
+    name = _MOVER_ONEBOT_NODE
+    target_url = _MOVER_ONEBOT_URL
     target = next(
         (
             client
@@ -821,6 +982,7 @@ def _snowluma_ws_client_config(config: dict[str, Any]) -> dict[str, Any]:
         "url": target_url,
         "role": "Universal",
         "reconnectIntervalMs": 5000,
+        "reportSelfMessage": True,
     }
     entry.pop("accessToken", None)
     if target is None:
@@ -829,6 +991,34 @@ def _snowluma_ws_client_config(config: dict[str, Any]) -> dict[str, Any]:
         target.clear()
         target.update(entry)
     return config
+
+
+def _enable_snowluma_account_self_reports(directory: Path) -> bool:
+    """Account snapshots can override the global SnowLuma connection settings."""
+    changed = False
+    for path in directory.glob("onebot_*.json"):
+        if not re.fullmatch(r"onebot_[0-9]+\.json", path.name) or not path.is_file() or path.is_symlink():
+            continue
+        try:
+            config = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        networks = config.get("networks") if isinstance(config, dict) else None
+        clients = networks.get("wsClients") if isinstance(networks, dict) else None
+        if not isinstance(clients, list):
+            continue
+        owned = [client for client in clients if isinstance(client, dict)
+                 and client.get("name") == _MOVER_ONEBOT_NODE
+                 and str(client.get("url") or "").rstrip("/") == _MOVER_ONEBOT_URL
+                 and client.get("reportSelfMessage") is not True]
+        if not owned:
+            continue
+        for client in owned:
+            client["reportSelfMessage"] = True
+        shutil.copy2(path, path.with_name(f"{path.stem}.pre-self-report-{time.time_ns()}.json"))
+        _atomic_json(path, config)
+        changed = True
+    return changed
 
 
 def snowluma_onebot_configured() -> bool:
@@ -844,6 +1034,7 @@ def snowluma_onebot_configured() -> bool:
         isinstance(client, dict)
         and client.get("url") == "ws://127.0.0.1:6199/ws"
         and client.get("enabled", True)
+        and client.get("reportSelfMessage") is True
         and not client.get("accessToken")
         for client in clients
     )
@@ -939,10 +1130,15 @@ def _tail_logs(root: Path, limit: int = 80) -> list[str]:
         return []
     latest = max(existing, key=lambda path: path.stat().st_mtime)
     try:
-        lines = latest.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        with latest.open("rb") as stream:
+            offset = max(0, latest.stat().st_size - 256 * 1024)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            lines = stream.read(256 * 1024).decode("utf-8", errors="replace").splitlines()[-limit:]
     except OSError:
         return []
-    return [INITIAL_PASSWORD_RE.sub("Initial password: [已隐藏]", line) for line in lines]
+    return [redact(INITIAL_PASSWORD_RE.sub("Initial password: [已隐藏]", line)) for line in lines]
 
 
 def _snowluma_first_run_pending() -> bool:
@@ -1146,8 +1342,24 @@ def launch_local_qq() -> dict[str, Any]:
     return {"opened": True, "already_running": already_running, "message": "已打开本机 QQ；如未登录，请用手机 QQ 扫描客户端二维码。"}
 
 
-def verify_rule_targets(data: dict[str, Any]) -> dict[str, Any]:
+def _rule_endpoints_key(rule: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(rule.get("source_platform", "")).strip(), str(rule.get("source_platform_id", "")).strip(),
+        str(rule.get("source_account_id", "")).strip(), str(rule.get("source_message_type", "GroupMessage")).strip(),
+        str(rule.get("source_session_id", "")).strip(), str(rule.get("target_umo", "")).strip(),
+        str(rule.get("target_account_id", "")).strip(),
+    )
+
+
+def verify_rule_targets(data: dict[str, Any], existing_rules: list | None = None) -> dict[str, Any]:
     normalized = validate_rules(data)
+    # Settings on already active directions can be changed while a platform is offline.
+    # New, re-enabled or rerouted directions still require current account verification.
+    existing = {_rule_endpoints_key(rule) for rule in (existing_rules or [])
+                if isinstance(rule, dict) and rule.get("enabled", True)}
+    to_verify = [rule for rule in normalized["rules"] if rule["enabled"] and _rule_endpoints_key(rule) not in existing]
+    if not to_verify:
+        return normalized
     discovery = mapping_discovery()
     qq_targets: dict[tuple[str, str], set[str]] = {}
     qq_accounts: dict[str, set[str]] = {}
@@ -1177,12 +1389,10 @@ def verify_rule_targets(data: dict[str, Any]) -> dict[str, Any]:
         if not account_id and len(online) != 1:
             raise ValueError(f"{label} QQ 私聊关联多个账号，请明确选择 QQ 账号。")
 
-    for rule in normalized["rules"]:
-        if not rule["enabled"]:
-            continue
+    qq_instance_ids = {str(item["id"]) for item in discovery["qq_instances"]}
+    for rule in to_verify:
         target_platform, _, target_session = rule["target_umo"].split(":", 2)
         _, target_type, _ = rule["target_umo"].split(":", 2)
-        qq_instance_ids = {str(item["id"]) for item in discovery["qq_instances"]}
         target_is_qq = target_platform in qq_instance_ids
         if target_platform != "larkx" and not target_is_qq:
             raise ValueError("目标平台必须是 QQ/OneBot 或飞书个人号。")
@@ -1215,11 +1425,20 @@ def verify_rule_targets(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def save_workbench_rules(data: dict[str, Any]) -> dict[str, Any]:
+    root = astrbot_root()
+    with _rules_lock:
+        current = read_rules(root)
+        updated = {"bridge_enabled": current["bridge_enabled"], **data}
+        return save_rules(root, verify_rule_targets(updated, current["rules"]))
+
+
 def set_bridge_enabled(enabled: bool) -> dict[str, Any]:
     root = astrbot_root()
-    current = read_rules(root)
-    current["bridge_enabled"] = bool(enabled)
-    saved = save_rules(root, current)
+    with _rules_lock:
+        current = read_rules(root)
+        current["bridge_enabled"] = bool(enabled)
+        saved = save_rules(root, current)
     return {"enabled": saved["bridge_enabled"], "total": len(saved["rules"]), "active": sum(bool(rule.get("enabled", True)) for rule in saved["rules"])}
 
 
@@ -1258,10 +1477,14 @@ def get_status() -> dict[str, Any]:
     return {
         "settings": settings,
         "workbench_root": str(ROOT),
+        "workbench_pid": os.getpid(),
+        "version": "2.0.9",
+        "background": background_runtime.status(ROOT),
         "astrbot": {
             "installed": ASTRBOT_EXE.is_file(),
             "root_ready": root_ready,
             "running": running,
+            "starting": not running and process is not None and process.poll() is None,
             "managed_here": managed_pid is not None,
             "pid": managed_pid,
             "url": f"http://127.0.0.1:{settings['astrbot_port']}/",
@@ -1392,9 +1615,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "MoverWorkbench/2.0"
 
     def log_message(self, format: str, *args: Any) -> None:
-        WORKBENCH_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with WORKBENCH_LOG.open("a", encoding="utf-8") as log_file:
-            log_file.write((format % args) + "\n")
+        if args and len(args) > 1 and str(args[1]) == "200" and str(args[0]).split(" ")[1].split("?")[0] in {"/api/status", "/api/logs", "/api/larkagentx/qr/status"}:
+            return
+        # Query strings can contain searches or resource identifiers.
+        append_log(WORKBENCH_LOG, datetime.now(timezone.utc).isoformat(timespec="seconds") + " " + re.sub(r"\?[^ ]*", "", format % args))
 
     def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -1440,6 +1664,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, integration_status())
         elif path == "/api/status":
             self._json(200, get_status())
+        elif path == "/api/logs":
+            try:
+                params = {key: values[-1] for key, values in parse_qs(urlparse(self.path).query).items()}
+                self._json(200, query_logs(ROOT, astrbot_root(), params))
+            except (ValueError, OSError) as exc:
+                self._json(400, {"error": str(exc)})
         elif path == "/api/larkagentx/status":
             self._json(200, larkx_status())
         elif path == "/api/larkagentx/qr/status":
@@ -1476,13 +1706,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         try:
-            data = self._read_json() if path != "/api/astrbot/stop" and path != "/api/bootstrap/clear" else {}
+            data = {} if path in {"/api/astrbot/stop", "/api/bootstrap/clear"} and self.headers.get("Content-Length", "0") == "0" else self._read_json()
             if path == "/api/settings":
                 result = self._save_settings(data)
             elif path == "/api/plugin/install":
                 result = {"installed": str(install_plugin(astrbot_root()))}
             elif path == "/api/rules":
-                result = save_rules(astrbot_root(), verify_rule_targets(data))
+                result = save_workbench_rules(data)
             elif path == "/api/bridge/enable":
                 result = set_bridge_enabled(data.get("enabled") is True)
             elif path == "/api/qq/launch":
@@ -1494,8 +1724,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(f"读取飞书会话失败（{type(exc).__name__}）；本机映射与凭证保持不变。") from exc
             elif path == "/api/astrbot/start":
                 result = start_astrbot(bool(data.get("reset_password", False)))
+                if not data.get("preserve_background"):
+                    background_runtime.set_desired(ROOT, astrbot_desired=True)
             elif path == "/api/astrbot/stop":
+                if not data.get("preserve_background"):
+                    background_runtime.set_desired(ROOT, astrbot_desired=False)
                 result = stop_astrbot()
+            elif path == "/api/background/config":
+                result = background_runtime.configure(ROOT, data)
+                if result.get("enabled"):
+                    background_runtime.ensure_supervisor(ROOT, int(os.environ.get("MOVER_WORKBENCH_PORT", "18766")))
             elif path == "/api/snowluma/start":
                 result = start_snowluma()
             elif path == "/api/snowluma/configure-onebot":
@@ -1513,6 +1751,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_admin_password(password)
                 result = {"saved": True}
             elif path == "/api/workbench/stop":
+                if not data.get("preserve_background"):
+                    background_runtime.set_desired(ROOT, enabled=False)
                 self._json(200, {"stopping": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return

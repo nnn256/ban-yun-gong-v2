@@ -18,7 +18,17 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-if (-not (Test-Path -LiteralPath $astrbotCommand -PathType Leaf)) {
+$environmentReady = $false
+if ((Test-Path -LiteralPath $venvPython -PathType Leaf) -and (Test-Path -LiteralPath $astrbotCommand -PathType Leaf)) {
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $venvPython -c "import astrbot, psutil, aiohttp, cryptography, win32crypt"
+        $environmentReady = $LASTEXITCODE -eq 0
+    }
+    finally { $ErrorActionPreference = $previousErrorPreference }
+}
+if (-not $environmentReady) {
     uv pip install --python $venvPython 'astrbot==4.29.4'
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
@@ -34,4 +44,5 @@ if (-not (Test-Path -LiteralPath (Join-Path $astrbotRoot '.astrbot') -PathType L
 }
 
 & (Join-Path $projectRoot 'install.ps1') -AstrBotRoot $astrbotRoot -Replace
+if ($LASTEXITCODE -ne 0) { throw "Bridge plugin setup failed ($LASTEXITCODE)." }
 Write-Output "AstrBot 4.29.4 and 搬运工V2 are ready under $astrbotRoot"

@@ -1,0 +1,9 @@
+{
+  "name": "SnowLuma Go",
+  "version": "1.0.9",
+  "repository": "https://github.com/Shou-Lu/Snowluma-Go",
+  "commit": "a56ee306be2ac877cdb3c745240831b0c43bc226",
+  "license": "AGPL-3.0",
+  "archive": "snowluma-go-1.0.9.zip",
+  "sha256": "176edc48c44ee736504679f187c74de23219ba769a34dbcbaf996ecc17615fc4"
+}

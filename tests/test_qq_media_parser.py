@@ -33,6 +33,8 @@ async def main():
         video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16)
         document = folder / "document fixture.txt"
         document.write_text("fixture attachment", encoding="utf-8")
+        opus = folder / "voice fixture.ogg"
+        opus.write_bytes(b"OggSfixture-opus-original-bytes")
         chain = MessageChain()
         chain.chain.extend([
             Record.fromFileSystem(str(wav)),
@@ -47,6 +49,10 @@ async def main():
         assert segments[1]["data"]["file"] == video.as_uri()
         assert segments[2]["data"]["file"] == document.as_uri()
         assert segments[2]["data"]["name"] == document.name
+        original_opus = MessageChain()
+        original_opus.chain.append(Record.fromFileSystem(str(opus)))
+        opus_segment = (await _onebot_segments(original_opus))[0]
+        assert base64.b64decode(opus_segment["data"]["file"][9:]) == opus.read_bytes()
         print("native record/video/file parser smoke passed")
 
 asyncio.run(main())

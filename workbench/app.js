@@ -1,17 +1,30 @@
-const UI_VERSION = '20261116-group-name-13'
+const UI_VERSION = '20261118-mapping-17'
 
 const state = {
   status: null,
   rules: [],
+  savedRules: [],
+  savingRules: false,
   filter: 'all',
-  dirty: false,
   page: new URLSearchParams(location.search).get('page') || localStorage.getItem('mover-v2-page') || 'overview',
   toastTimer: null,
   larkxQrTimer: null,
   mappingDiscovery: null,
   mappingDiscoveryPromise: null,
+  mappingEditingIndices: [],
+  mappingSelfEdited: false,
   bridgeEnabled: null,
 }
+
+const contentTypeOptions = [
+  { value: 'text', name: '文字' },
+  { value: 'emoji', name: '表情包' },
+  { value: 'image', name: '图片' },
+  { value: 'video', name: '视频' },
+  { value: 'audio', name: '语音' },
+  { value: 'file', name: '文件' },
+]
+const defaultContentTypes = contentTypeOptions.map(option => option.value)
 
 const $ = (selector, root = document) => root.querySelector(selector)
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)]
@@ -62,7 +75,7 @@ function routeTarget(route) {
     ? 'larkx'
     : 'aiocqhttp'
   return {
-    platformId: parts[0] === 'larkx' ? (route.source_platform === 'aiocqhttp' ? 'default' : parts[0]) : (parts[0] || '—'),
+    platformId: parts[0] === 'larkx' ? 'default' : (parts[0] || '—'),
     messageType: parts[1] || '',
     sessionId: parts.slice(2).join(':') || '—',
     platform,
@@ -278,7 +291,7 @@ function renderStatus(status) {
   if (document.activeElement !== rootInput) rootInput.value = status.settings.astrbot_root
   const portInput = $('#astrbotPort')
   if (document.activeElement !== portInput) portInput.value = status.settings.astrbot_port
-  renderLogs(status.logs || [])
+  renderBackground(status.background || {})
   $('#lastUpdated').textContent = `刚刚刷新 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
 }
 
@@ -292,7 +305,8 @@ async function pollLarkXQr() {
   try {
     const qr = await request('/api/larkagentx/qr/status')
     state.larkxQrStatus = qr.status
-    if (qr.status === 'authenticated' || qr.status === 'error' || qr.status === 'expired' || qr.status === 'cancelled') {
+    if (['starting', 'waiting_scan', 'awaiting_confirm', 'error'].includes(qr.status)) $('#larkxQrPanel').hidden = false
+    if (qr.status === 'authenticated' || qr.status === 'error' || qr.status === 'expired' || qr.status === 'cancelled' || qr.status === 'not_started') {
       clearInterval(state.larkxQrTimer)
       state.larkxQrTimer = null
     }
@@ -329,6 +343,68 @@ function renderLogs(logs) {
     entry.append(time, text)
     return entry
   }))
+}
+
+function renderBackground(background) {
+  const text = background.running ? '守护进程运行中，关闭浏览器仍会监控。' : background.enabled ? '后台恢复已启用，守护进程尚未就绪。' : '后台恢复已关闭。'
+  if ($('#backgroundSummary')) $('#backgroundSummary').textContent = text
+  if (!state.backgroundEditing) {
+    if ($('#backgroundEnabled')) $('#backgroundEnabled').checked = background.enabled === true
+    if ($('#backgroundSleep')) $('#backgroundSleep').checked = background.keep_awake === true
+    if ($('#backgroundAutostart')) $('#backgroundAutostart').checked = background.autostart === true
+  }
+  if ($('#backgroundDetail')) $('#backgroundDetail').textContent = `${text} ${background.keep_awake_active ? '当前已请求系统保持唤醒，显示器仍可关闭。' : '系统唤醒状态以守护进程为准。'}`
+}
+
+async function refreshLogs(older = false) {
+  if (state.logsLoading || !$('#logList')) return
+  state.logsLoading = true
+  try {
+    const selectedFile = $('#logFile').value
+    const params = new URLSearchParams({ component: $('#logComponent').value, level: $('#logLevel').value, q: $('#logSearch').value, limit: '1000', file: selectedFile })
+    if (older === true && state.logBefore != null) params.set('before', String(state.logBefore))
+    for (const [key, id] of [['since', 'logSince'], ['until', 'logUntil']]) {
+      const value = $(`#${id}`).value
+      if (value) params.set(key, new Date(value).toISOString())
+    }
+    const result = await request(`/api/logs?${params}`)
+    const fileSelect = $('#logFile')
+    const defaultOption = document.createElement('option')
+    defaultOption.value = ''; defaultOption.textContent = '所有组件最新日志'
+    fileSelect.replaceChildren(defaultOption, ...(result.files || []).map(file => {
+      const option = document.createElement('option')
+      option.value = file.id; option.textContent = `[${file.component}] ${file.name}`
+      return option
+    }))
+    if ([...fileSelect.options].some(option => option.value === selectedFile)) fileSelect.value = selectedFile
+    state.logBefore = result.next_before
+    $('#olderLogs').disabled = !selectedFile || result.next_before == null
+    state.logEntries = result.entries || []
+    const list = $('#logList')
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 50
+    list.replaceChildren(...state.logEntries.map(entry => {
+      const node = document.createElement('div')
+      node.className = `log-entry log-${String(entry.level).toLowerCase()}`
+      const time = document.createElement('time')
+      time.textContent = new Date(entry.time).toLocaleString()
+      const text = document.createElement('span')
+      text.textContent = `[${entry.component} · ${entry.level}] ${entry.text}`
+      node.append(time, text)
+      return node
+    }))
+    if (!state.logEntries.length) {
+      const empty = document.createElement('p')
+      empty.className = 'empty-inline'
+      empty.textContent = '没有匹配的日志；组件启动并产生日志后会显示在这里。'
+      list.append(empty)
+    }
+    if (atBottom) list.scrollTop = list.scrollHeight
+    $('#logQueryStatus').textContent = `${new Date().toLocaleTimeString()} · ${state.logEntries.length} 条 · ${result.files?.length || 0} 个日志文件${result.bounded ? ' · 选择文件后可查询更早日志' : ''}`
+  } catch (error) {
+    $('#logQueryStatus').textContent = `日志读取失败：${error.message}`
+  } finally {
+    state.logsLoading = false
+  }
 }
 
 function endpointDisplayName(platform, instance, accountId, sessionId) {
@@ -388,11 +464,12 @@ function renderRules() {
       <td class="table-direction">→</td>
       <td><div class="table-platform"><span class="platform-brand ${target.platform === 'aiocqhttp' ? 'qq-brand' : 'feishu-brand'}">${target.platform === 'aiocqhttp' ? 'Q' : '飞'}</span><span>${escapeHtml(platformLabel(target.platform))}<code class="table-id">${escapeHtml(target.platformId)}${route.target_account_id ? ` · QQ ${escapeHtml(route.target_account_id)}` : ''}</code></span></div></td>
       <td>${escapeHtml(endpointDisplayName(target.platform, target.platformId, route.target_account_id, target.sessionId))}<code class="table-id">${escapeHtml(target.sessionId)}</code></td>
+      <td class="route-content-types">${escapeHtml(routeContentTypeLabel(route))}</td>
       <td><button class="toggle" type="button" data-toggle-route="${index}" aria-pressed="${enabledState}" aria-label="${enabledState ? '停用' : '启用'} ${escapeHtml(route.name || '映射')}"></button></td>
-      <td><button class="table-action" type="button" data-toggle-self="${index}" aria-pressed="${route.include_self === true}">${route.include_self === true ? '转发本人：开' : '转发本人：关'}</button><button class="table-action" type="button" data-remove-route="${index}">删除</button></td>
+      <td><button class="table-action edit" type="button" data-edit-route="${index}">编辑</button><button class="table-action" type="button" data-toggle-self="${index}" aria-pressed="${route.include_self === true}">${route.include_self === true ? '转发本人：开' : '转发本人：关'}</button><button class="table-action" type="button" data-remove-route="${index}">删除</button></td>
     </tr>`
   }).join('')
-  list.innerHTML = `<table class="rules-table"><thead><tr><th>来源平台</th><th>来源会话</th><th aria-label="方向"></th><th>目标平台</th><th>目标会话</th><th>状态</th><th>本人消息 / 操作</th></tr></thead><tbody>${rows}</tbody></table>`
+  list.innerHTML = `<table class="rules-table"><thead><tr><th>来源平台</th><th>来源会话</th><th aria-label="方向"></th><th>目标平台</th><th>目标会话</th><th>转发类型</th><th>状态</th><th>本人消息 / 操作</th></tr></thead><tbody>${rows}</tbody></table>`
   renderOverviewRoutes()
 }
 
@@ -402,8 +479,7 @@ async function refresh(loadRules = false) {
     renderStatus(status)
     if (loadRules) {
       const config = await request('/api/rules')
-      state.rules = Array.isArray(config.rules) ? config.rules : []
-      state.dirty = false
+      state.savedRules = state.rules = Array.isArray(config.rules) ? config.rules : []
       renderRules()
     }
   } catch (error) {
@@ -427,11 +503,29 @@ async function postAction(path, payload = {}, successText = '') {
   }
 }
 
-function addOrReplaceRoute(route) {
-  const key = routeIdentity(route)
-  const existing = state.rules.findIndex(item => routeIdentity(item) === key)
-  if (existing >= 0) state.rules[existing] = route
-  else state.rules.push(route)
+async function saveMappings(rules, successText, { keepTableEdits = false } = {}) {
+  state.savingRules = true
+  $('#submitMapping').disabled = true
+  $('#saveRules').disabled = true
+  $('#rulesTable').setAttribute('aria-busy', 'true')
+  try {
+    const saved = await request('/api/rules', { method: 'POST', body: JSON.stringify({ rules }) })
+    if (keepTableEdits && state.rules !== state.savedRules) {
+      // The row switch saves only the self flag. Keep staged status/deletion edits in the table.
+      const flags = new Map(saved.rules.map(route => [routeIdentity(route), route.include_self]))
+      state.rules = state.rules.map(route => ({ ...route, include_self: flags.get(routeIdentity(route)) === true }))
+    } else {
+      state.rules = saved.rules
+    }
+    state.savedRules = saved.rules
+    renderRules()
+    toast(successText)
+  } finally {
+    state.savingRules = false
+    $('#submitMapping').disabled = false
+    $('#saveRules').disabled = false
+    $('#rulesTable').setAttribute('aria-busy', 'false')
+  }
 }
 
 function endpoint(side) {
@@ -448,7 +542,7 @@ function endpointIdentity(value) {
   return [value.platform, value.instance, value.platform === 'aiocqhttp' ? value.account : '', value.messageType, value.session].join('|')
 }
 
-function buildRouteFromEndpoints(source, target, includeSelf = false) {
+function buildRouteFromEndpoints(source, target, includeSelf = false, contentTypes = defaultContentTypes) {
   return {
     name: `${platformLabel(source.platform)} ${source.session} → ${platformLabel(target.platform)} ${target.session}`,
     enabled: true,
@@ -460,7 +554,21 @@ function buildRouteFromEndpoints(source, target, includeSelf = false) {
     source_account_id: source.platform === 'aiocqhttp' ? source.account : '',
     target_account_id: target.platform === 'aiocqhttp' ? target.account : '',
     target_umo: `${target.platform === 'larkx' ? 'larkx' : target.instance}:${target.messageType}:${target.session}`,
+    content_types: contentTypeOptions.filter(option => contentTypes.includes(option.value)).map(option => option.value),
   }
+}
+
+function routeEndpoints(route) {
+  const target = routeTarget(route)
+  return [
+    { platform: route.source_platform, instance: route.source_platform_id, account: route.source_account_id || '', messageType: route.source_message_type, session: route.source_session_id },
+    { platform: target.platform, instance: target.platformId, account: route.target_account_id || '', messageType: target.messageType, session: target.sessionId },
+  ]
+}
+
+function routeContentTypeLabel(route) {
+  const selected = Array.isArray(route.content_types) ? route.content_types : defaultContentTypes
+  return contentTypeOptions.filter(option => selected.includes(option.value)).map(option => option.name).join('、') || '未选择'
 }
 
 function endpointQqAccounts(side, discovery = state.mappingDiscovery) {
@@ -505,7 +613,7 @@ function renderSessionPicker(side, values) {
   picker.value = options.some(option => option.value === selected) ? selected : ''
 }
 
-function renderEndpoint(side) {
+function renderEndpoint(side, savedAccount = '') {
   const discovery = state.mappingDiscovery || {}
   const value = endpoint(side)
   const isQq = value.platform === 'aiocqhttp'
@@ -517,7 +625,7 @@ function renderEndpoint(side) {
   if (!$(`#${side}Instance`).value.trim() && instances.length === 1) $(`#${side}Instance`).value = String(instances[0].id)
   if (!isQq && !$(`#${side}Instance`).value.trim()) $(`#${side}Instance`).value = 'default'
   if (isQq) {
-    const selected = accountSelect.value
+    const selected = savedAccount || accountSelect.value
     const accounts = endpointQqAccounts(side, discovery)
     const option = document.createElement('option')
     option.value = ''
@@ -527,9 +635,15 @@ function renderEndpoint(side) {
       node.value = String(account.user_id)
       const online = account.connected === true && account.identity_verified === true
       node.textContent = `${account.nickname || 'QQ'} (${account.user_id}) · ${online ? '在线 · 已验证' : '离线/未验证'}`
-      node.disabled = !online
+      node.disabled = !online && node.value !== selected
       return node
     })
+    if (selected && !options.some(node => node.value === selected)) {
+      const savedOption = document.createElement('option')
+      savedOption.value = selected
+      savedOption.textContent = `QQ (${selected}) · 当前选择，尚未验证`
+      options.push(savedOption)
+    }
     accountSelect.replaceChildren(option, ...options)
     accountSelect.value = options.some(node => node.value === selected && !node.disabled) ? selected : ''
     const allGroups = accounts.filter(account => account.connected === true && account.identity_verified === true).flatMap(account =>
@@ -573,7 +687,7 @@ async function loadMappingDiscovery({ refresh = false } = {}) {
       const discovery = await request('/api/mapping/discovery', refresh ? { method: 'POST', body: '{}' } : {})
       if (!$('#mappingDialog').open) return
       state.mappingDiscovery = discovery
-      const suggested = discovery.suggested || {}
+      const suggested = state.mappingEditingIndices.length ? {} : (discovery.suggested || {})
       for (const side of ['source', 'target']) {
         const isQq = $(`#${side}Platform`).value === 'aiocqhttp'
         const session = $(`#${side}Session`)
@@ -591,7 +705,7 @@ async function loadMappingDiscovery({ refresh = false } = {}) {
           }
         }
       }
-      $('#mappingDiscoveryStatus').textContent = `QQ：${discoveryCoverage(discovery.coverage?.qq)}；飞书：${discoveryCoverage(discovery.coverage?.feishu)}。自动读取仅填充空白字段。`
+      $('#mappingDiscoveryStatus').textContent = `QQ：${discoveryCoverage(discovery.coverage?.qq)}；飞书：${discoveryCoverage(discovery.coverage?.feishu)}。${state.mappingEditingIndices.length ? '已保留当前表单设置。' : '自动读取仅填充空白字段。'}`
       const warnings = Array.isArray(discovery.warnings) ? discovery.warnings.map(String) : []
       $('#mappingDiscoveryWarnings').hidden = !warnings.length
       $('#mappingDiscoveryWarnings').textContent = warnings.join('；')
@@ -609,27 +723,129 @@ async function loadMappingDiscovery({ refresh = false } = {}) {
   return state.mappingDiscoveryPromise
 }
 
-function openMappingDialog() {
+function routeReciprocalIndex(index) {
+  const route = state.rules[index]
+  if (!route) return -1
+  const [source, target] = routeEndpoints(route)
+  const reverseIdentity = routeIdentity(buildRouteFromEndpoints(target, source))
+  return state.rules.findIndex((candidate, candidateIndex) => candidateIndex !== index && routeIdentity(candidate) === reverseIdentity)
+}
+
+function setMappingEndpoint(side, endpointValue) {
+  $(`#${side}Platform`).value = endpointValue.platform
+  $(`#${side}Instance`).value = endpointValue.instance
+  $(`#${side}MessageType`).value = endpointValue.messageType
+  $(`#${side}Session`).value = endpointValue.session
+  $(`#${side}SessionSearch`).value = ''
+  $(`#${side}Account`).value = ''
+  renderEndpoint(side, endpointValue.account)
+}
+
+function showMappingSelfState() {
+  const [forwardIndex, reverseIndex] = state.mappingEditingIndices
+  const checkbox = $('#mappingIncludeSelf')
+  const forwardSelf = state.rules[forwardIndex]?.include_self === true
+  const reverse = $('#mappingDirection').value === 'both' ? state.rules[reverseIndex] : null
+  checkbox.indeterminate = Boolean(reverse && forwardSelf !== (reverse.include_self === true))
+  checkbox.checked = !checkbox.indeterminate && forwardSelf
+}
+
+function populateMappingEditor() {
+  const indices = state.mappingEditingIndices
+  const route = state.rules[indices[0]]
+  if (!route) return
+  const [source, target] = routeEndpoints(route)
+  setMappingEndpoint('source', source)
+  setMappingEndpoint('target', target)
+  const selectedTypes = new Set(Array.isArray(route.content_types) ? route.content_types : defaultContentTypes)
+  $$('#contentTypeOptions input[name="contentType"]').forEach(input => { input.checked = selectedTypes.has(input.value) })
+  $('#mappingDirection').value = indices.length > 1 ? 'both' : 'forward'
+  showMappingSelfState()
+  $('#mappingDialogTitle').textContent = indices.length > 1 ? '编辑双向映射' : '编辑转发规则'
+  $('#submitMapping').textContent = '保存修改'
+}
+
+function openMappingDialog(routeIndex = null) {
+  if (state.savingRules) return
   $('#dialogError').hidden = true
+  $('#mappingDiscoveryWarnings').hidden = true
+  state.mappingEditingIndices = []
+  state.mappingSelfEdited = false
+  if (Number.isInteger(routeIndex) && state.rules[routeIndex]) {
+    const reciprocal = routeReciprocalIndex(routeIndex)
+    state.mappingEditingIndices = reciprocal < 0 ? [routeIndex] : [routeIndex, reciprocal]
+  }
+  if (state.mappingEditingIndices.length) populateMappingEditor()
+  else renderMappingSources()
   $('#mappingDialog').showModal()
-  renderMappingSources()
   $('#sourcePlatform').focus()
   loadMappingDiscovery()
 }
 
 function closeMappingDialog() {
+  if (state.savingRules) return
   $('#mappingDialog').close()
   $('#mappingForm').reset()
-  state.mappingDiscovery = null
+  state.mappingEditingIndices = []
+  $('#mappingIncludeSelf').indeterminate = false
+  $('#mappingDialogTitle').textContent = '新增群映射'
+  $('#submitMapping').textContent = '创建映射'
+}
+
+function proposedMappingRules(source, target, contentTypes) {
+  const [forwardIndex, reverseIndex] = state.mappingEditingIndices
+  const both = $('#mappingDirection').value === 'both'
+  const checkbox = $('#mappingIncludeSelf')
+  const previousForward = state.rules[forwardIndex]
+  const previousReverse = state.rules[reverseIndex]
+  const originalTypes = previousForward?.content_types || defaultContentTypes
+  const typesUnchanged = originalTypes.length === contentTypes.length && contentTypes.every(type => originalTypes.includes(type))
+  const build = (from, to, previous, types) => {
+    const includeSelf = checkbox.indeterminate ? previous?.include_self === true : checkbox.checked
+    const route = buildRouteFromEndpoints(from, to, includeSelf, types)
+    if (previous) {
+      route.enabled = previous.enabled !== false
+      route.name = previous.name || route.name
+    }
+    return route
+  }
+  const forward = build(source, target, previousForward, contentTypes)
+  const reverse = both ? build(target, source, previousReverse, typesUnchanged && previousReverse ? (previousReverse.content_types || defaultContentTypes) : contentTypes) : null
+  const keys = new Set([forward, reverse].filter(Boolean).map(routeIdentity))
+  if (state.rules.some((route, index) => index !== forwardIndex && index !== reverseIndex && keys.has(routeIdentity(route)))) {
+    throw new Error('已有相同方向的账号会话映射。请编辑现有规则或选择其他会话。')
+  }
+  const rules = state.rules.flatMap((route, index) => index === forwardIndex ? [forward] : index === reverseIndex ? (reverse ? [reverse] : []) : [route])
+  if (forwardIndex === undefined) rules.push(forward)
+  if (reverse && reverseIndex === undefined) rules.push(reverse)
+  return rules
 }
 
 function bindEvents() {
+  $('#logQuery').addEventListener('submit', event => { event.preventDefault(); refreshLogs() })
+  for (const id of ['logComponent', 'logLevel', 'logFile']) $(`#${id}`).addEventListener('change', () => refreshLogs())
+  $('#olderLogs').addEventListener('click', () => { $('#logLive').checked = false; refreshLogs(true) })
+  $('#exportLogs').addEventListener('click', () => {
+    const blob = new Blob([(state.logEntries || []).map(entry => `${entry.time} [${entry.component}] ${entry.text}`).join('\n')], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url; link.download = `mover-logs-${Date.now()}.txt`; link.click()
+    URL.revokeObjectURL(url)
+  })
+  $('#backgroundForm').addEventListener('change', () => { state.backgroundEditing = true })
+  $('#backgroundForm').addEventListener('submit', async event => {
+    event.preventDefault()
+    const saved = await postAction('/api/background/config', { enabled: $('#backgroundEnabled').checked, keep_awake: $('#backgroundSleep').checked, autostart: $('#backgroundAutostart').checked }, '后台设置已保存')
+    if (saved) { state.backgroundEditing = false; await refresh(false) }
+  })
   $$('.nav-item').forEach(button => button.addEventListener('click', () => setPage(button.dataset.page)))
   $$('[data-page-link]').forEach(button => button.addEventListener('click', () => setPage(button.dataset.pageLink)))
   $$('[data-open-mapping]').forEach(button => button.addEventListener('click', openMappingDialog))
   $('#closeDialog').addEventListener('click', closeMappingDialog)
   $('#cancelDialog').addEventListener('click', closeMappingDialog)
   $('#refreshMappingDiscovery').addEventListener('click', () => loadMappingDiscovery({ refresh: true }))
+  $('#mappingDirection').addEventListener('change', () => { if (!state.mappingSelfEdited) showMappingSelfState() })
+  $('#mappingIncludeSelf').addEventListener('change', () => { state.mappingSelfEdited = true })
   for (const side of ['source', 'target']) {
     $(`#${side}Platform`).addEventListener('change', () => {
       $(`#${side}Instance`).value = ''
@@ -657,48 +873,66 @@ function bindEvents() {
   $('#mappingDialog').addEventListener('click', event => {
     if (event.target === $('#mappingDialog')) closeMappingDialog()
   })
+  $('#mappingDialog').addEventListener('cancel', event => { event.preventDefault(); closeMappingDialog() })
   $('#mappingForm').addEventListener('submit', async event => {
     event.preventDefault()
+    if (state.savingRules) return
+    const errorNode = $('#dialogError')
+    errorNode.hidden = true
     const source = endpoint('source')
     const target = endpoint('target')
-    const error = [source, target].some(value => !value.instance || !value.session || (value.platform === 'aiocqhttp' && !value.account))
-      ? '请选择两端平台、实例、QQ 账号和会话 ID。'
-      : endpointIdentity(source) === endpointIdentity(target) ? '来源和目标不能是同一个账号会话。' : ''
-    if (error) {
-      $('#dialogError').textContent = error
-      $('#dialogError').hidden = false
-      return
+    const contentTypes = $$('#contentTypeOptions input[name="contentType"]:checked').map(input => input.value)
+    const error = !contentTypes.length
+      ? '至少选择一种转发内容类型。'
+      : [source, target].some(value => !value.instance || !value.session || (value.platform === 'aiocqhttp' && !value.account))
+        ? '请选择两端平台、实例、QQ 账号和会话 ID。'
+        : endpointIdentity(source) === endpointIdentity(target) ? '来源和目标不能是同一个账号会话。' : ''
+    try {
+      if (error) throw new Error(error)
+      await saveMappings(proposedMappingRules(source, target, contentTypes), '群映射已保存')
+      closeMappingDialog()
+    } catch (error) {
+      errorNode.textContent = error.message
+      errorNode.hidden = false
     }
-    const includeSelf = $('#mappingIncludeSelf').checked
-    addOrReplaceRoute(buildRouteFromEndpoints(source, target, includeSelf))
-    if ($('#mappingDirection').value === 'both') addOrReplaceRoute(buildRouteFromEndpoints(target, source, includeSelf))
-    renderRules()
-    const saved = await postAction('/api/rules', { managed_platforms: ['aiocqhttp', 'larkx'], rules: state.rules }, '群映射已保存')
-    if (saved) closeMappingDialog()
   })
 
-  $('#rulesTable').addEventListener('click', event => {
+  $('#rulesTable').addEventListener('click', async event => {
+    if (state.savingRules) return
+    const edit = event.target.closest('[data-edit-route]')
+    if (edit) {
+      openMappingDialog(Number(edit.dataset.editRoute))
+      return
+    }
     const toggle = event.target.closest('[data-toggle-route]')
     if (toggle) {
-      const route = state.rules[Number(toggle.dataset.toggleRoute)]
-      if (route) route.enabled = route.enabled === false
-      state.dirty = true
+      const selected = Number(toggle.dataset.toggleRoute)
+      state.rules = state.rules.map((route, index) => index === selected ? { ...route, enabled: route.enabled === false } : route)
       renderRules()
       return
     }
     const selfToggle = event.target.closest('[data-toggle-self]')
     if (selfToggle) {
       const route = state.rules[Number(selfToggle.dataset.toggleSelf)]
-      if (route) route.include_self = route.include_self !== true
-      state.dirty = true
-      renderRules()
+      if (!route) return
+      const savedIndex = state.savedRules.findIndex(item => routeIdentity(item) === routeIdentity(route))
+      if (savedIndex < 0) return
+      const includeSelf = route.include_self !== true
+      const rules = state.savedRules.map((item, index) => index === savedIndex ? { ...item, include_self: includeSelf } : item)
+      selfToggle.disabled = true
+      try {
+        await saveMappings(rules, includeSelf ? '此方向已开启本人消息转发' : '此方向已关闭本人消息转发', { keepTableEdits: true })
+      } catch (error) {
+        toast(`本人消息设置未保存：${error.message}`, true)
+      } finally {
+        selfToggle.disabled = false
+      }
       return
     }
     const remove = event.target.closest('[data-remove-route]')
     if (remove) {
       const index = Number(remove.dataset.removeRoute)
-      state.rules.splice(index, 1)
-      state.dirty = true
+      state.rules = state.rules.filter((_, selected) => selected !== index)
       renderRules()
     }
   })
@@ -708,8 +942,9 @@ function bindEvents() {
     renderRules()
   }))
   $('#saveRules').addEventListener('click', async () => {
-    const saved = await postAction('/api/rules', { managed_platforms: ['aiocqhttp', 'larkx'], rules: state.rules }, '群映射已保存')
-    if (saved) state.dirty = false
+    if (state.savingRules) return
+    try { await saveMappings(state.rules, '群映射已保存') }
+    catch (error) { toast(error.message, true) }
   })
 
   $('#bridgeToggle').addEventListener('click', async () => {
@@ -808,5 +1043,11 @@ if (ensureMatchingPage()) {
   bindEvents()
   setPage(state.page)
   refresh(true)
+  refreshLogs()
+  setInterval(() => { if ($('#logLive').checked && state.page === 'overview') refreshLogs() }, 1200)
+  if (new URLSearchParams(location.search).get('autostart') === '1') {
+    pollLarkXQr()
+    state.larkxQrTimer = setInterval(pollLarkXQr, 2000)
+  }
   setInterval(() => refresh(false), 4500)
 }

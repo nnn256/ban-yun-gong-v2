@@ -17,7 +17,7 @@ import zipfile
 APP_ID = "information-mover-v2"
 MANIFEST_NAME = "release-manifest.json"
 ROOT_FILES = {
-    ".gitignore", "README.md", "VERIFICATION.txt", "launch-workbench.cmd",
+    ".gitignore", "README.md", "VERIFICATION.txt", "PROTOCOL_REVIEW.md", "launch-workbench.cmd",
     "一键启动.cmd", "更新并启动.cmd", "build-portable.ps1", "portable_launcher.cs",
     "后台运行.vbs", "打开工作台.vbs",
     "install.ps1", "install_astrbot.ps1", "install_larkagentx.ps1", "install_snowluma.ps1",
@@ -53,7 +53,11 @@ def safe_payload_name(name: str) -> str:
             raise UpdateError("Invalid Windows package path")
         if part.casefold() in FORBIDDEN_NAMES or part.casefold() == "__pycache__":
             raise UpdateError("Package attempted to include user data")
+    if path.suffix.casefold() in {".db", ".sqlite", ".sqlite3", ".log", ".jsonl", ".session", ".dpapi", ".pyc"}:
+        raise UpdateError("Package attempted to include runtime storage")
     if name in ROOT_FILES or name in TOOLS:
+        return name
+    if name == "tests/fixtures/larkx_receive_contract.json":
         return name
     if len(path.parts) >= 2 and path.parts[0] in DIRECTORIES and path.suffix in DIRECTORIES[path.parts[0]]:
         return name

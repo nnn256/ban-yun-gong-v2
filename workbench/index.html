@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="zh-CN" data-workbench-ui="20261118-mapping-17">
+<html lang="zh-CN" data-workbench-ui="20261122-send-gate-15">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f4f6f4">
     <title>搬运工V2 工作台</title>
-    <link rel="stylesheet" href="/assets/style.css?v=20261118-mapping-17">
-    <script defer src="/assets/app.js?v=20261118-mapping-17"></script>
+    <link rel="stylesheet" href="/assets/style.css?v=20261122-send-gate-15">
+    <script defer src="/assets/app.js?v=20261122-send-gate-15"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -64,6 +64,11 @@
                 <div class="runtime-title-line"><h2 id="runtimeTitle">AstrBot 本地实例</h2><span id="runtimeTag" class="mini-tag tag-neutral">未启动</span></div>
                 <p id="runtimeDetail">服务就绪后，桥接插件会拦截 QQ / 飞书事件并按群映射转发。</p>
                 <code id="runtimePath">D:\搬运工V2\runtime\AstrBot</code>
+                <div class="runtime-build">
+                  <span id="bridgeBuildState" class="mini-tag tag-neutral">桥接版本待核对</span>
+                  <p id="bridgeBuildDetail" role="status">正在核对桥接插件实际加载的版本。</p>
+                  <button id="exportBuildDiagnostics" class="button button-quiet button-small" type="button" title="只导出匿名版本与代码指纹，不包含账号、消息、密码或群映射">导出版本诊断 JSON</button>
+                </div>
               </div>
               <div class="runtime-actions">
                 <button id="installPlugin" class="button button-outline" type="button">安装桥接插件</button>
@@ -94,6 +99,9 @@
                 </div>
               </div>
               <p class="connection-footnote"><span class="note-mark">i</span><span id="feishuMonitorActivity">飞书实时监听等待状态检查。LarkAgentX 使用本地个人账号会话，agent backend 固定为 none。</span></p>
+              <p class="connection-footnote"><span class="note-mark">i</span><span id="qqSendReadiness" role="status">正在核对 QQ 发送权限…</span></p>
+              <div class="connection-footnote"><span class="note-mark">i</span><span id="deliveryQueueActivity" role="status">正在读取飞书转发队列…</span><button id="retryFailedDelivery" class="button button-quiet button-small" type="button" disabled>重试失败消息</button></div>
+              <p class="connection-footnote"><span class="note-mark">i</span><span id="historyRecoveryActivity">等待飞书补读状态…</span></p>
             </section>
 
             <section class="mapping-section" aria-labelledby="mappingOverviewTitle">
@@ -113,12 +121,12 @@
                 <form id="logQuery" class="log-filters">
                   <label>组件<select id="logComponent"><option value="all">全部组件</option><option value="bridge">转发插件</option><option value="astrbot">AstrBot</option><option value="snowluma">SnowLuma</option><option value="feishu">飞书连接</option><option value="supervisor">后台守护</option><option value="workbench">工作台</option><option value="bootstrap">启动配置</option></select></label>
                   <label>级别<select id="logLevel"><option value="all">全部级别</option><option value="INFO">信息</option><option value="WARNING">警告</option><option value="ERROR">错误</option><option value="DEBUG">调试</option></select></label>
-                  <label>关键词<input id="logSearch" type="search" placeholder="查找错误、事件或会话 ID"></label>
+                  <label>关键词<input id="logSearch" type="search" placeholder="查找错误、事件或转发编号"></label>
                   <label>日志文件<select id="logFile"><option value="">所有组件最新日志</option></select></label>
                   <label>开始时间<input id="logSince" type="datetime-local"></label><label>结束时间<input id="logUntil" type="datetime-local"></label>
                   <button class="button button-quiet button-small" type="submit">查询</button>
                   <label class="log-live"><input id="logLive" type="checkbox" checked>实时刷新</label>
-                  <button id="exportLogs" class="button button-quiet button-small" type="button">导出当前结果</button>
+                  <button id="exportLogs" class="button button-quiet button-small" type="button">导出诊断日志 ZIP</button>
                   <button id="olderLogs" class="button button-quiet button-small" type="button" disabled>更早日志</button>
                 </form>
                 <p id="logQueryStatus" class="section-note" role="status">正在读取日志…</p>
@@ -198,6 +206,7 @@
                 <label><input id="backgroundAutostart" type="checkbox">Windows 登录后自动运行</label>
                 <button type="submit" class="button button-primary button-small">保存后台设置</button>
               </form>
+              <p class="field-help">需要息屏继续转发时，请开启前两项并保存，确认上方显示“防空闲睡眠请求已生效”。请使用显示器关闭功能；电源键、“睡眠”或合盖可能让电脑进入睡眠。</p>
             </section>
             <div class="page-heading">
               <div><p class="eyebrow">LOCAL INSTANCE</p><h1 id="settingsTitle">本地设置</h1><p class="page-subtitle">工作台与 AstrBot 的本机目录和管理端口。</p></div>

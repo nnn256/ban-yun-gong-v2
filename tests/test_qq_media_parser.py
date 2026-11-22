@@ -1,4 +1,5 @@
 """Exercise the installed AstrBot parser outside the plugin's test stubs."""
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 class InstalledQQMediaParserTests(unittest.TestCase):
     def test_local_audio_video_and_attachment_keep_native_onebot_segments(self):
         project = Path(__file__).resolve().parents[1]
-        python = project / "runtime" / ".venv" / "Scripts" / "python.exe"
+        python = Path(os.environ.get("MOVER_VERIFY_PYTHON") or project / "runtime" / ".venv" / "Scripts" / "python.exe")
         if not python.is_file():
             self.skipTest("Local AstrBot runtime is not installed")
         script = r'''

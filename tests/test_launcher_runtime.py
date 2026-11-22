@@ -60,10 +60,10 @@ class PortableLauncherRuntimeTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=30)
 
     def flag_probe(self):
-        self.make_stub('''param([switch]$NoBrowser,[switch]$SkipDesktopActions,[switch]$ResumeBackground)
+        self.make_stub('''param([switch]$NoBrowser,[switch]$SkipDesktopActions,[switch]$ResumeBackground,[switch]$StartHere)
 Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd); }'
 $window=[ConsoleProbe]::GetConsoleWindow()
-@{no_browser=[bool]$NoBrowser;no_desktop=[bool]$SkipDesktopActions;resume=[bool]$ResumeBackground;console_visible=($window -ne [IntPtr]::Zero -and [ConsoleProbe]::IsWindowVisible($window))} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'flags.json') -Encoding UTF8
+@{no_browser=[bool]$NoBrowser;no_desktop=[bool]$SkipDesktopActions;resume=[bool]$ResumeBackground;start_here=[bool]$StartHere;console_visible=($window -ne [IntPtr]::Zero -and [ConsoleProbe]::IsWindowVisible($window))} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'flags.json') -Encoding UTF8
 ''')
 
     def read_flags(self):
@@ -72,7 +72,7 @@ $window=[ConsoleProbe]::GetConsoleWindow()
         while time.monotonic() < deadline:
             try:
                 return json.loads(marker.read_text(encoding="utf-8-sig"))
-            except (FileNotFoundError, json.JSONDecodeError):
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                 time.sleep(.05)
         self.fail("The detached launcher did not finish its flag probe")
 
@@ -82,13 +82,13 @@ $window=[ConsoleProbe]::GetConsoleWindow()
             with self.subTest(args=args):
                 self.assertEqual(self.run_launcher(args=args).returncode, 0)
                 self.assertEqual(self.read_flags(), {"no_browser": True, "no_desktop": True,
-                                                     "resume": resume, "console_visible": False})
+                                                     "resume": resume, "start_here": False, "console_visible": False})
 
     def test_open_workbench_explicitly_allows_browser_and_login_steps_without_console(self):
         self.flag_probe()
-        self.assertEqual(self.run_launcher(args=("--open",)).returncode, 0)
+        self.assertEqual(self.run_launcher(args=("--open", "--start-here")).returncode, 0)
         self.assertEqual(self.read_flags(), {"no_browser": False, "no_desktop": False,
-                                             "resume": False, "console_visible": False})
+                                             "resume": False, "start_here": True, "console_visible": False})
 
     def test_background_failure_exits_and_logs_without_blocking_on_a_dialog(self):
         self.make_stub("Write-Output 'expected-fixture-failure'; exit 7")
@@ -113,7 +113,7 @@ $window=[ConsoleProbe]::GetConsoleWindow()
                                         creationflags=subprocess.CREATE_NO_WINDOW)
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(self.read_flags(), {"no_browser": not expected_open, "no_desktop": not expected_open,
-                                                     "resume": False, "console_visible": False})
+                                                     "resume": False, "start_here": False, "console_visible": False})
                 # flags.json is written just before process exit and mutex release.
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:

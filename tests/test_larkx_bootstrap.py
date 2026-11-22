@@ -120,7 +120,7 @@ class LarkXBootstrapTests(unittest.TestCase):
 
     def test_hosted_plan_uses_actual_astrbot_requirements_and_preserves_other_pins(self):
         source = ROOT / "runtime" / "LarkAgentX-runtime" / ("LarkAgentX-" + COMMIT)
-        python = ROOT / "runtime" / ".venv" / "Scripts" / "python.exe"
+        python = Path(os.environ.get("MOVER_VERIFY_PYTHON") or ROOT / "runtime" / ".venv" / "Scripts" / "python.exe")
         if not source.is_dir() or not python.is_file():
             self.skipTest("Installed AstrBot runtime not available")
         result = subprocess.run([str(python), "-I", "-B", "-c", embedded_python("dependencyCode"), str(source)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)

@@ -1,6 +1,10 @@
 """Personal Feishu image and attachment transport without resource-key text."""
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 import base64
 import binascii
 import ipaddress
@@ -26,6 +30,7 @@ MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 MAX_MEDIA_REDIRECTS = 4
 MAX_NATIVE_DURATION_MS = 2_147_483_647
 NATIVE_UPLOAD_PART_SIZE = 4 * 1024 * 1024
+_IMAGE_RESOURCE_KEY = re.compile(r"[A-Za-z0-9_.-]{1,200}")
 
 
 class ImageTransferError(ValueError):
@@ -178,8 +183,13 @@ def send_image(client: Any, chat_id: str, source: Any) -> str | None:
         key = media.upload_image(client.auth, str(path))
         if not key:
             raise ImageTransferError("飞书图片上传未返回资源标识")
-        message_id = client.send(str(chat_id), image_key=key)
-    return str(message_id) if message_id else None
+        try:
+            message_id = client.send(str(chat_id), image_key=key)
+        except Exception as exc:
+            raise NativeMediaDeliveryUncertain("飞书图片发送结果不确定，未自动重发") from exc
+    if not message_id:
+        raise NativeMediaDeliveryUncertain("飞书图片发送未返回回执，未自动重发")
+    return str(message_id)
 
 
 def is_image_message(message: dict[str, Any]) -> bool:
@@ -187,19 +197,33 @@ def is_image_message(message: dict[str, Any]) -> bool:
     return value in (5, "5", "image", "IMAGE")
 
 
+def image_resource_key(message: dict[str, Any]) -> str | None:
+    """Read the pinned LarkAgentX IMAGE fields without auth or networking."""
+    body = message.get("content_data")
+    if not is_image_message(message) or not isinstance(body, dict):
+        return None
+    v2 = body.get("imageV2")
+    legacy = body.get("image")
+    origin = legacy.get("origin") if isinstance(legacy, dict) else None
+    keys = (
+        v2.get("imageKey") if isinstance(v2, dict) else None,
+        origin.get("key") if isinstance(origin, dict) else None,
+        legacy.get("imageKey") if isinstance(legacy, dict) else None,
+    )
+    return next((key for key in keys if isinstance(key, str) and key not in {".", ".."}
+                 and _IMAGE_RESOURCE_KEY.fullmatch(key)), None)
+
+
 def download_image(client: Any, message: dict[str, Any]) -> bytes:
     """Download an authenticated Feishu IMAGE as bytes for Image.fromBytes()."""
     if client is None or not is_image_message(message):
         raise ImageTransferError("飞书图片消息或客户端不可用")
-    media = _lark_media()
-    content_data = message.get("content_data") or {}
-    if not isinstance(content_data, dict):
-        raise ImageTransferError("飞书图片消息格式无效")
-    key = media.extract_resource_key(5, content_data)
+    key = image_resource_key(message)
     message_id = str(message.get("msg_id") or message.get("message_id") or "")
     chat_id = str(message.get("chat_id") or "")
     if not key or not message_id or not chat_id:
         raise ImageTransferError("飞书图片缺少下载所需的资源标识")
+    media = _lark_media()
     auth = client.auth
     resource = media.message_resource_url(message_id, key, chat_id, host=auth.region.file_host)
     data, _content_type = media.download(auth, resource, max_bytes=MAX_IMAGE_BYTES)
@@ -566,7 +590,9 @@ def send_native_media(client: Any, chat_id: str, source: Any, kind: str) -> str:
             message_id = builders.decode_put_message_response(response)
         except Exception as exc:
             raise NativeMediaDeliveryUncertain("原生媒体发送响应无法确认，请核对目标会话后再决定是否重发") from exc
-        if not message_id or str(message_id).startswith("-"):
+        if not message_id:
+            raise NativeMediaDeliveryUncertain("飞书原生媒体发送未返回回执，未自动重发")
+        if str(message_id).startswith("-"):
             raise ImageTransferError("飞书没有返回有效的原生媒体消息回执")
         return str(message_id)
 
@@ -597,8 +623,13 @@ def send_attachment(client: Any, chat_id: str, source: Any, filename: str = "", 
         uploaded = media.upload_file(client.auth, str(path))
         if not isinstance(uploaded, dict) or not uploaded.get("key"):
             raise ImageTransferError("飞书附件上传未返回资源标识")
-        message_id = client.send(str(chat_id), file=uploaded)
-    return str(message_id) if message_id else None
+        try:
+            message_id = client.send(str(chat_id), file=uploaded)
+        except Exception as exc:
+            raise NativeMediaDeliveryUncertain("飞书附件发送结果不确定，未自动重发") from exc
+    if not message_id:
+        raise NativeMediaDeliveryUncertain("飞书附件发送未返回回执，未自动重发")
+    return str(message_id)
 
 
 def download_attachment(client: Any, message: dict[str, Any]) -> tuple[bytes, str, str]:

@@ -66,7 +66,12 @@ class WorkbenchConfigTests(unittest.TestCase):
             ):
                 result = server.load_settings()
                 self.assertEqual(result, {"astrbot_root": str(local.resolve()), "astrbot_port": 7199})
-                replace.assert_called_once_with(settings.with_suffix(".json.tmp"), settings)
+                replace.assert_called_once()
+                temporary, destination = replace.call_args.args
+                self.assertEqual(destination, settings)
+                self.assertEqual(temporary.parent, settings.parent)
+                self.assertNotEqual(temporary, settings)
+                self.assertFalse(temporary.exists())
                 self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), {**original, "astrbot_root": str(local.resolve())})
                 self.assertFalse(settings.with_suffix(".json.tmp").exists())
                 self.assertEqual(server.load_settings(), result)

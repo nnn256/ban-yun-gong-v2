@@ -16,6 +16,19 @@ import urllib.request
 
 import background_runtime as runtime
 
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _set_execution_state(flags: int) -> tuple[bool, int | None]:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel.SetThreadExecutionState
+    function.argtypes = [ctypes.c_uint32]
+    function.restype = ctypes.c_uint32
+    ctypes.set_last_error(0)
+    success = bool(function(flags))
+    return success, None if success else ctypes.get_last_error()
+
 
 def _request(port: int, path: str, body: dict | None = None):
     data = None if body is None else json.dumps(body).encode("utf-8")
@@ -46,6 +59,9 @@ class Supervisor:
         self.next_try = {"workbench": 0.0, "astrbot": 0.0}
         self.healthy_since = {"workbench": None, "astrbot": None}
         self.awake = False
+        self.power_state = "pending"
+        self.power_error_code = None
+        self._ready_reported = False
         directory = self.root / "runtime/logs"
         directory.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("mover-supervisor-" + runtime._install_key(self.root))
@@ -57,22 +73,34 @@ class Supervisor:
             self.logger.addHandler(handler)
 
     def _power(self, enabled: bool):
+        previous_state, previous_error = self.power_state, self.power_error_code
+        self.awake = False
+        self.power_error_code = None
         if os.name == "nt":
             # ES_SYSTEM_REQUIRED deliberately allows Windows to turn off the display.
-            function = ctypes.windll.kernel32.SetThreadExecutionState
-            function.argtypes = [ctypes.c_uint32]
-            function.restype = ctypes.c_uint32
-            success = function(0x80000001 if enabled else 0x80000000)
-            self.awake = bool(success) and enabled
+            try:
+                success, error = _set_execution_state(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enabled else 0))
+            except (OSError, AttributeError) as exc:
+                success, error = False, getattr(exc, "winerror", 0)
+            self.awake = success and enabled
+            self.power_state = "active" if self.awake else "failed" if enabled else "disabled"
+            if enabled and not success:
+                self.power_error_code = error if type(error) is int and 0 <= error <= 0xFFFFFFFF else 0
         else:
-            self.awake = False
+            self.power_state = "unsupported" if enabled else "disabled"
+        if self.power_state == "failed" and (previous_state, previous_error) != (self.power_state, self.power_error_code):
+            self.logger.warning("Idle sleep prevention request failed (Win32 error %s); automatic recovery remains active", self.power_error_code)
+        elif self.power_state == "active" and previous_state == "failed":
+            self.logger.info("Idle sleep prevention request recovered; display may turn off")
 
     def _state(self, state: str, workbench: str, astrbot: str):
         runtime._atomic_json(self.root / "runtime/background.status.json", {
+            "install_key": runtime._install_key(self.root),
             "pid": self.pid, "process_started_at": self.started_at,
             "heartbeat_at": datetime.now(timezone.utc).isoformat(), "state": state,
             "workbench_state": workbench, "astrbot_state": astrbot,
-            "keep_awake_active": self.awake, "restart_count": self.restart_count,
+            "keep_awake_active": self.awake, "keep_awake_state": self.power_state,
+            "keep_awake_error_code": self.power_error_code, "restart_count": self.restart_count,
         })
 
     def _backoff(self, name: str, error: str):
@@ -102,6 +130,11 @@ class Supervisor:
             self._state("stopped", "unmanaged", "unmanaged")
             return False
         self._power(config["keep_awake"])
+        if not self._ready_reported:
+            # Publish ownership and the actual power result before any network
+            # probe (which may block while the workbench is still starting).
+            self._state("starting", "unknown", "unknown")
+            self._ready_reported = True
         if runtime.paused(self.root):
             self._state("paused", "updating", "updating")
             return True
@@ -161,11 +194,26 @@ class Supervisor:
         elif time.monotonic() < self.next_try["astrbot"]:
             self._state("recovering", "running", "retry_wait")
         else:
-            if not runtime.settings(self.root)["enabled"] or runtime.paused(self.root):
+            latest = runtime.settings(self.root)
+            if not latest["enabled"] or runtime.paused(self.root):
+                return True
+            if not latest["astrbot_desired"]:
+                self._state("running", "running", "manually_stopped")
                 return True
             self._state("recovering", "running", "restarting")
             try:
-                result = _request(port, "/api/astrbot/start", {"reset_password": False, "preserve_background": True})
+                result = _request(port, "/api/astrbot/start", {"reset_password": False, "preserve_background": True, "automatic_recovery": True})
+                if result.get("skipped") is True and result.get("started") is False:
+                    if result.get("reason") == "disabled":
+                        self._power(False)
+                        self._state("stopped", "unmanaged", "unmanaged")
+                        return False
+                    if result.get("reason") == "paused":
+                        self._state("paused", "updating", "updating")
+                        return True
+                    if result.get("reason") == "manually_stopped":
+                        self._state("running", "running", "manually_stopped")
+                        return True
                 if not result.get("started"):
                     raise ValueError("not_started")
                 self.restart_count += 1
@@ -200,7 +248,7 @@ def main():
             kernel.CloseHandle(handle)
             return
     supervisor = Supervisor(root)
-    supervisor.logger.info("Background supervisor started; display may turn off; idle system sleep prevented while enabled")
+    supervisor.logger.info("Background supervisor started; requesting idle-sleep prevention when enabled; display may turn off")
     try:
         while True:
             try:

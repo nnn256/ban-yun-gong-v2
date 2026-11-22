@@ -317,6 +317,41 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
         self.assertFalse((self.target / "runtime/fixture-started.json").exists())
         self.assert_protected()
 
+    def test_setup_uses_free_workbench_port_without_touching_other_install(self):
+        self.environment.pop("MOVER_WORKBENCH_PORT")
+        script = self.source / "update-and-start.ps1"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            alternate = listener.getsockname()[1]
+        script.write_text(script.read_text(encoding="utf-8-sig").replace("18766", str(self.port)).replace(
+            "18767..18786", str(alternate)), encoding="utf-8-sig")
+        stub = self.source / "start-workbench.ps1"
+        stub.write_text(START_STUB.replace("started=$true;", "port=$env:MOVER_WORKBENCH_PORT;started=$true;"),
+                        encoding="utf-8-sig")
+        self.seal()
+        with self.winreg.CreateKey(self.winreg.HKEY_CURRENT_USER, self.key_name) as key:
+            self.winreg.SetValueEx(key, "InstallRoot", 0, self.winreg.REG_SZ, str(self.target))
+        with self.running_workbench(self.target) as posts:
+            process = self.run_update("-StartHere", "-NoBrowser", "-SkipDesktopActions")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(posts, [])
+        flags = json.loads((self.source / "runtime/fixture-started.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(flags["port"], str(alternate))
+        self.assertFalse((self.target / "runtime/fixture-started.json").exists())
+        self.assert_protected()
+
+    def test_setup_preserves_saved_workbench_port_and_rejects_foreign_occupancy(self):
+        self.environment.pop("MOVER_WORKBENCH_PORT")
+        background_runtime.set_desired(self.source, port=self.port, autostart=False, keep_awake=False)
+        config = self.source / "runtime/background.settings.json"
+        before = config.read_bytes()
+        with self.running_workbench(self.target) as posts:
+            process = self.run_update("-StartHere", "-NoBrowser", "-SkipDesktopActions")
+        self.assertEqual(process.returncode, 20, process.stdout + process.stderr)
+        self.assertEqual(posts, [])
+        self.assertEqual(config.read_bytes(), before)
+        self.assertFalse((self.source / "runtime/fixture-started.json").exists())
+
     def test_invalid_distribution_fails_before_program_or_login_changes(self):
         (self.source / "workbench_server.py").write_text("TAMPERED\n")
         process = self.run_update("-TargetRoot", str(self.target), "-NoStart")
@@ -372,7 +407,7 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
         url = f"http://127.0.0.1:{self.port}"
         opener = build_opener(ProxyHandler({}))
         try:
-            process = subprocess.run([str(launcher), "--background"], cwd=self.root, env=self.environment,
+            process = subprocess.run([str(launcher), "--background", "--start-here"], cwd=self.root, env=self.environment,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             logs = list((self.source / "runtime/logs").glob("launcher-*.log"))
             details = "\n".join(log.read_text(encoding="utf-8") for log in logs)

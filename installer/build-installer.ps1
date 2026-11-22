@@ -1,5 +1,7 @@
 ﻿param(
-    [string]$OutputPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts/搬运工V2-安装程序.exe')
+    [string]$OutputPath,
+    [string]$PortablePath,
+    [switch]$PortableOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,49 +10,53 @@ $artifactRoot = Join-Path $projectRoot 'artifacts'
 $buildRoot = Join-Path $artifactRoot ('.installer-build-' + [guid]::NewGuid().ToString('N'))
 $cacheRoot = Join-Path $artifactRoot '.installer-cache'
 $payloadRoot = Join-Path $buildRoot 'payload'
-$wixExe = 'C:/Program Files/WiX Toolset v7.0/bin/wix.exe'
+$metadata = Get-Content -LiteralPath (Join-Path $projectRoot 'astrbot_plugin_message_bridge/metadata.yaml') -Raw -Encoding UTF8
+$versionMatch = [regex]::Match($metadata, '(?m)^version:\s*v(\d+\.\d+\.\d+)\s*$')
+if (-not $versionMatch.Success) { throw 'Bridge metadata must specify a three-part release version.' }
+$releaseVersion = $versionMatch.Groups[1].Value
+if (-not $OutputPath) { $OutputPath = Join-Path $artifactRoot "搬运工V2-Setup-$releaseVersion-x64.exe" }
+if ($PortableOnly -and -not $PortablePath) { $PortablePath = Join-Path $artifactRoot "搬运工V2-$releaseVersion.zip" }
+if (-not $PortableOnly) {
+    if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Use PowerShell 7 to build the WiX installer.' }
+    $wixExe = (Get-Command wix.exe -ErrorAction Stop).Source
+}
 $uvVersion = '0.13.8'
 $uvExecutableHash = '03FA174894B9D0CBE08762D40D1C2C64D10E875BD56F1A1E334EE1E00D60CDBE'
 
 & (Join-Path $projectRoot 'verify.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Project verification failed; installer was not built.' }
 Write-Output '[1/5] Project tests passed.'
-$portableLauncher = Join-Path $artifactRoot 'portable/搬运工V2.exe'
-$portableUv = Join-Path $artifactRoot 'portable/tools/uv.exe'
+$portableLauncher = Join-Path $buildRoot 'launcher/搬运工V2.exe'
+$portableUv = Join-Path $buildRoot 'launcher/tools/uv.exe'
 & (Join-Path $projectRoot 'build-portable.ps1') -OutputExe $portableLauncher -UvOutput $portableUv
 if ($LASTEXITCODE -ne 0) { throw 'Portable launcher build failed; installer was not built.' }
-if (-not (Test-Path -LiteralPath $wixExe -PathType Leaf)) {
-    throw "WiX Toolset v7 was not found: $wixExe"
-}
-
 New-Item -ItemType Directory -Force -Path $payloadRoot,$artifactRoot,$cacheRoot | Out-Null
 $rootFiles = @(
-    'README.md', 'VERIFICATION.txt', 'launch-workbench.cmd', '一键启动.cmd',
+    'README.md', 'VERIFICATION.txt', 'PROTOCOL_REVIEW.md', 'launch-workbench.cmd', '一键启动.cmd',
     '后台运行.vbs', '打开工作台.vbs',
     'updater.py', 'update-and-start.ps1', '更新并启动.cmd', 'log_store.py',
     'install.ps1', 'install_astrbot.ps1', 'install_larkagentx.ps1',
     'install_snowluma.ps1', 'start_snowluma.ps1', 'start-workbench.ps1',
     'stop-workbench.ps1', 'background_runtime.py', 'background_supervisor.py', 'astrbot_runner.py',
-    'workbench_server.py', 'workbench.settings.example.json'
+    'workbench_server.py', 'workbench.settings.example.json',
+    'astrbot_plugin_message_bridge/__init__.py', 'astrbot_plugin_message_bridge/bridge_core.py',
+    'astrbot_plugin_message_bridge/bridge_rules.example.json', 'astrbot_plugin_message_bridge/build_identity.py',
+    'astrbot_plugin_message_bridge/event_log.py', 'astrbot_plugin_message_bridge/larkx_bridge.py',
+    'astrbot_plugin_message_bridge/larkx_history.py', 'astrbot_plugin_message_bridge/larkx_inbox.py',
+    'astrbot_plugin_message_bridge/larkx_media.py', 'astrbot_plugin_message_bridge/larkx_merge.py',
+    'astrbot_plugin_message_bridge/larkx_receive.py', 'astrbot_plugin_message_bridge/larkx_richtext.py',
+    'astrbot_plugin_message_bridge/main.py', 'astrbot_plugin_message_bridge/metadata.yaml',
+    'astrbot_plugin_message_bridge/qq_emojis.py', 'astrbot_plugin_message_bridge/qq_transport.py',
+    'astrbot_plugin_message_bridge/runtime_status.py', 'astrbot_plugin_message_bridge/snowluma_watchdog.py',
+    'workbench/app.js', 'workbench/index.html', 'workbench/style.css',
+    'vendor/snowluma-go-1.0.9.zip', 'vendor/snowluma-go.json'
 )
 foreach ($file in $rootFiles) {
-    Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $payloadRoot $file)
+    $target = Join-Path $payloadRoot $file
+    New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination $target
 }
 Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $payloadRoot 'mover-v2-launcher.exe')
-
-foreach ($directory in @('astrbot_plugin_message_bridge', 'workbench', 'vendor')) {
-    $source = Join-Path $projectRoot $directory
-    $destination = Join-Path $payloadRoot $directory
-    New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    Get-ChildItem -LiteralPath $source -Recurse -File |
-        Where-Object { $_.FullName -notmatch '\\(__pycache__|node_modules)\\' -and $_.Extension -ne '.pyc' } |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($source.Length + 1)
-            $target = Join-Path $destination $relative
-            New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination $target
-        }
-}
 
 $forbiddenNames = @('credentials.json', 'bridge_rules.json', 'cmd_config.json', 'onebot.json',
                     'workbench.settings.json', '.workbench-bootstrap.dpapi', '.mover-v2-astrbot.pid')
@@ -89,7 +95,8 @@ foreach ($license in @('LICENSE-APACHE', 'LICENSE-MIT')) {
 }
 Write-Output '[4/5] uv license notices staged from portable build.'
 
-$manifestPython = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe'
+$manifestPython = $env:MOVER_VERIFY_PYTHON
+if (-not $manifestPython) { $manifestPython = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe' }
 $manifestPythonArgs = @()
 if (-not (Test-Path -LiteralPath $manifestPython -PathType Leaf)) {
     $pythonLauncher = Get-Command py -ErrorAction SilentlyContinue
@@ -97,8 +104,32 @@ if (-not (Test-Path -LiteralPath $manifestPython -PathType Leaf)) {
     $manifestPython = $pythonLauncher.Source
     $manifestPythonArgs = @('-3')
 }
-& $manifestPython @manifestPythonArgs -B (Join-Path $projectRoot 'updater.py') manifest $payloadRoot --version 2.0.9
+& $manifestPython @manifestPythonArgs -B (Join-Path $projectRoot 'updater.py') manifest $payloadRoot --version $releaseVersion
 if ($LASTEXITCODE -ne 0) { throw 'Could not seal the installer application payload.' }
+
+function Build-PortableZip {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zipStage = Join-Path $buildRoot 'portable'
+    $tempZip = Join-Path $buildRoot 'portable.zip'
+    $zipCheck = Join-Path $buildRoot '便携版 验证目录'
+    Copy-Item -LiteralPath $payloadRoot -Destination $zipStage -Recurse
+    Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $zipStage '搬运工V2.exe')
+    [IO.Compression.ZipFile]::CreateFromDirectory($zipStage, $tempZip)
+    & $manifestPython @manifestPythonArgs -B (Join-Path $projectRoot 'updater.py') seal $tempZip --version $releaseVersion
+    if ($LASTEXITCODE -ne 0) { throw 'Could not seal the exact portable ZIP.' }
+    Expand-Archive -LiteralPath $tempZip -DestinationPath $zipCheck
+    $check = Start-Process -FilePath (Join-Path $zipCheck '搬运工V2.exe') -ArgumentList '--check' -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru
+    if ($check.ExitCode -ne 0) { throw "Portable ZIP launcher self-check failed: $($check.ExitCode)" }
+    $zipPath = [IO.Path]::GetFullPath($PortablePath)
+    New-Item -ItemType Directory -Force -Path (Split-Path $zipPath -Parent) | Out-Null
+    Move-Item -LiteralPath $tempZip -Destination $zipPath -Force
+    Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 | Format-List
+}
+
+if ($PortableOnly) {
+    Build-PortableZip
+    return
+}
 
 $extensions = (& $wixExe extension list -g | Out-String)
 if ($extensions -notmatch 'WixToolset\.BootstrapperApplications\.wixext\s+7\.0\.1') {
@@ -211,7 +242,7 @@ $wixDocument.Save($generatedWxs)
 
 $msi = Join-Path $buildRoot 'MoverV2.msi'
 Write-Output '[5/5] Compiling MSI and Chinese EXE installer.'
-& $wixExe build (Join-Path $PSScriptRoot 'Product.wxs') $generatedWxs -arch x64 -o $msi -pdbtype none
+& $wixExe build (Join-Path $PSScriptRoot 'Product.wxs') $generatedWxs -arch x64 -d "ReleaseVersion=$releaseVersion" -o $msi -pdbtype none
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $msi -PathType Leaf)) {
     throw 'WiX failed to build the MSI package.'
 }
@@ -221,6 +252,7 @@ $temporaryExe = Join-Path $buildRoot '搬运工V2-安装程序.exe'
 & $wixExe build (Join-Path $PSScriptRoot 'Bundle.wxs') `
     -ext 'WixToolset.BootstrapperApplications.wixext/7.0.1' `
     -arch x64 `
+    -d "ReleaseVersion=$releaseVersion" `
     -d "MsiPath=$msi" `
     -d "InstallerSource=$PSScriptRoot" `
     -loc (Join-Path $PSScriptRoot 'zh-CN.wxl') `
@@ -240,3 +272,4 @@ $installerHash = (Get-FileHash -LiteralPath $finalPath -Algorithm SHA256).Hash
     BundledUv = $uvVersionOutput
     VerifiedUvExecutableSHA256 = $actualUvHash
 } | Format-List
+if ($PortablePath) { Build-PortableZip }

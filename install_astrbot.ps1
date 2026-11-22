@@ -1,4 +1,6 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param([string]$ResultPath)
+
+$ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $runtimeDir = Join-Path $projectRoot 'runtime'
 $astrbotRoot = Join-Path $runtimeDir 'AstrBot'
@@ -43,6 +45,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $astrbotRoot '.astrbot') -PathType L
     finally { Pop-Location }
 }
 
-& (Join-Path $projectRoot 'install.ps1') -AstrBotRoot $astrbotRoot -Replace
+& (Join-Path $projectRoot 'install.ps1') -AstrBotRoot $astrbotRoot -Replace -ResultPath $ResultPath
 if ($LASTEXITCODE -ne 0) { throw "Bridge plugin setup failed ($LASTEXITCODE)." }
 Write-Output "AstrBot 4.29.4 and 搬运工V2 are ready under $astrbotRoot"

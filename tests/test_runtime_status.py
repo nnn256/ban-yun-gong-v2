@@ -86,6 +86,7 @@ class RuntimeStatusTests(unittest.IsolatedAsyncioTestCase):
         monitor = self.monitor(fake_context(bot))
         self.assertEqual((await monitor.refresh())["qq"]["accounts"][0]["groups_status"], "verified")
         bot.groups = {"error": "NEVER-EXPORT"}
+        monitor._refreshed_at -= 3
         account = (await monitor.refresh())["qq"]["accounts"][0]
         self.assertTrue(account["identity_verified"])
         self.assertEqual(account["groups_status"], "unavailable")
@@ -125,10 +126,18 @@ class RuntimeStatusTests(unittest.IsolatedAsyncioTestCase):
                     "webui_port": 5100, "webui_url": "https://evil.example/NEVER-EXPORT",
                     "config": {"password": "NEVER-EXPORT"}, "last_error": "NEVER-EXPORT"}
 
-        state = await self.monitor(fake_context(snow=SimpleNamespace(status=status))).refresh()
+        async def probe(method, path, **kwargs):
+            self.assertEqual(method, "GET")
+            return 200, {"/api/agreements": {"consentRequired": False},
+                         "/api/auth/state": {"mustChangePassword": False}}[path]
+
+        snow = SimpleNamespace(status=status, api=SimpleNamespace(token="fixture", raw_request=probe))
+        state = await self.monitor(fake_context(snow=snow)).refresh()
+        self.assertGreater(state["snowluma"].pop("send_checked_at"), 0)
         self.assertEqual(state["snowluma"], {"state": "known", "installed": True, "running": True, "auth_ok": True,
                                             "consent_required": False, "accounts": [{"uin": "12345", "nickname": "Fixture QQ"}],
-                                            "webui_port": 5100, "webui_url": "http://127.0.0.1:5100/"})
+                                            "webui_port": 5100, "webui_url": "http://127.0.0.1:5100/",
+                                            "send_ready": True, "send_state": "ready", "must_change_password": False})
         self.assertNotIn("NEVER-EXPORT", json.dumps(state))
 
     async def test_missing_snowluma_manager_remains_explicitly_unknown(self):

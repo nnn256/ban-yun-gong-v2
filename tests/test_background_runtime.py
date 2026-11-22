@@ -63,6 +63,7 @@ class BackgroundRuntimeTests(unittest.TestCase):
 
     def test_live_supervisor_with_stale_heartbeat_is_reported_unresponsive(self):
         live = {"pid": os.getpid(), "process_started_at": runtime.process_started_at(os.getpid()),
+                "install_key": runtime._install_key(self.root),
                 "state": "running", "keep_awake_active": True,
                 "heartbeat_at": (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()}
         runtime._atomic_json(self.root / "runtime/background.status.json", live)
@@ -160,7 +161,8 @@ class BackgroundRuntimeTests(unittest.TestCase):
             supervisor.tick()
         starts = [call for call in requests.call_args_list if call.args[1] == "/api/astrbot/start"]
         self.assertEqual(len(starts), 1)
-        self.assertEqual(starts[0].args[2], {"reset_password": False, "preserve_background": True})
+        self.assertEqual(starts[0].args[2], {"reset_password": False, "preserve_background": True,
+                                            "automatic_recovery": True})
         self.assertGreater(supervisor.next_try["astrbot"], time.monotonic())
 
     def test_live_unresponsive_workbench_is_not_duplicated(self):

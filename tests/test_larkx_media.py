@@ -76,22 +76,21 @@ class ImageTransportTests(unittest.TestCase):
         client = SimpleNamespace(auth=auth)
         resource_url = "https://fixture.invalid/download/messages/msg/keys/key?chat_id=chat"
         lark = SimpleNamespace(
-            extract_resource_key=Mock(return_value="fixture-key"),
             message_resource_url=Mock(return_value=resource_url),
             download=Mock(return_value=(PNG, "image/png")),
         )
         message = {"msg_type": "5", "content_data": {"imageV2": {"imageKey": "fixture-key"}}, "msg_id": "msg", "chat_id": "chat"}
         with patch.object(media, "_lark_media", return_value=lark):
             self.assertEqual(media.download_image(client, message), PNG)
-        lark.extract_resource_key.assert_called_once_with(5, message["content_data"])
         lark.message_resource_url.assert_called_once_with("msg", "fixture-key", "chat", host=auth.region.file_host)
         lark.download.assert_called_once_with(auth, resource_url, max_bytes=media.MAX_IMAGE_BYTES)
 
-    def test_failed_native_send_does_not_report_delivery(self):
+    def test_missing_native_send_receipt_is_uncertain(self):
         client = SimpleNamespace(auth=object(), send=Mock(return_value=None))
         lark = SimpleNamespace(upload_image=Mock(return_value="fixture-key"))
-        with patch.object(media, "_lark_media", return_value=lark):
-            self.assertIsNone(media.send_image(client, "fixture-chat", PNG))
+        with patch.object(media, "_lark_media", return_value=lark), self.assertRaises(media.NativeMediaDeliveryUncertain):
+            media.send_image(client, "fixture-chat", PNG)
+        client.send.assert_called_once()
 
 
 class AttachmentTransportTests(unittest.TestCase):

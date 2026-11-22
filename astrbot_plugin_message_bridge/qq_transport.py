@@ -1,10 +1,15 @@
 """Send through a specific OneBot account and retain its server receipt."""
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 import inspect
 import re
 import asyncio
 import base64
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -14,7 +19,143 @@ class QQRoutingError(RuntimeError):
 
 
 class QQSendError(RuntimeError):
-    """OneBot did not confirm a successful send with a message id."""
+    """The request was not sent or the server explicitly rejected it."""
+
+    def __init__(self, message: str, *, code: str = "qq_rejected", http_status: int = 0):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+
+
+class QQSendBlocked(QQSendError):
+    """A known pre-send gate; keep queued work without spending its attempts."""
+
+
+def _gate(state: str, *, http_status: int = 0) -> dict:
+    if state not in {"ready", "consent_required", "password_change_required", "auth_required", "unavailable"}:
+        state = "unavailable"
+    return {"send_ready": state == "ready", "send_state": state,
+            "send_checked_at": int(time.time()), "http_status": http_status}
+
+
+def rejection_code(status: int, payload: Any) -> str:
+    """Only export fixed codes, never an untrusted server message."""
+    if status == 403 and isinstance(payload, Mapping):
+        if payload.get("consentRequired") is True:
+            return "consent_required"
+        if payload.get("mustChangePassword") is True:
+            return "password_change_required"
+    return {401: "auth_required", 404: "account_offline", 429: "rate_limited"}.get(status, "qq_rejected")
+
+
+def install_onebot_result_guard() -> bool:
+    """Ignore duplicate/late replies without tearing down reverse WebSockets."""
+    try:
+        from aiocqhttp.api_impl import ResultStore
+    except ImportError:
+        return False
+    original = ResultStore.add.__func__
+    if getattr(original, "_mover_result_guard", False):
+        return True
+
+    def add(cls, result):
+        if not isinstance(result, dict):
+            return
+        echo = result.get("echo")
+        if not isinstance(echo, dict) or type(echo.get("seq")) is not int:
+            return
+        future = cls._futures.get(echo["seq"])
+        if future is None or future.done():
+            return
+        try:
+            return original(cls, result)
+        except asyncio.InvalidStateError:
+            # A timeout/cancel may have settled this request already. It must
+            # not abort the socket's read loop or replace the first response.
+            return
+
+    add._mover_result_guard = True
+    ResultStore.add = classmethod(add)
+    return True
+
+
+async def snowluma_send_gate(manager: Any, *, force: bool = False) -> dict:
+    """Probe permission to send using read-only APIs in the owner's session.
+
+    /api/status remains available behind both agreement and password gates.
+    It therefore proves liveness, not permission to invoke a OneBot action.
+    Coalesce status polling and send checks; never record consent here.
+    """
+    cached = getattr(manager, "_mover_send_gate", None)
+    api = getattr(manager, "api", None)
+    if (not force and cached and cached[0] is api
+            and time.monotonic() - cached[1] < (5 if cached[2]["send_ready"] else 2)):
+        return dict(cached[2])
+    task = getattr(manager, "_mover_send_gate_task", None)
+    if task is None or task.done():
+        async def check() -> dict:
+            api = getattr(manager, "api", None)
+            try:
+                if not callable(getattr(api, "raw_request", None)):
+                    return _gate("auth_required")
+                for attempt in range(2):
+                    if not getattr(api, "token", "") or attempt:
+                        ensure = getattr(manager, "ensure_api", None)
+                        if not callable(ensure):
+                            return _gate("auth_required")
+                        api = await ensure(quiet=True)
+                        if not callable(getattr(api, "raw_request", None)):
+                            return _gate("auth_required")
+                    status, agreements = await api.raw_request("GET", "/api/agreements", timeout=5)
+                    if status == 401 and not attempt:
+                        continue
+                    if status != 200:
+                        return _gate(rejection_code(status, agreements), http_status=status)
+                    if not isinstance(agreements, Mapping) or type(agreements.get("consentRequired")) is not bool:
+                        return _gate("unavailable")
+                    if agreements["consentRequired"]:
+                        # Use the existing, explicit local preference. New
+                        # installations keep the vendor's opt-out default.
+                        config = getattr(getattr(manager, "plugin", None), "config", {})
+                        accept = getattr(manager, "accept_agreements", None)
+                        if isinstance(config, Mapping) and config.get("auto_accept_agreements") is True and callable(accept):
+                            accepted = await accept()
+                            if not isinstance(accepted, Mapping) or accepted.get("ok") is not True:
+                                return _gate("consent_required", http_status=403)
+                            status, agreements = await api.raw_request("GET", "/api/agreements", timeout=5)
+                            if (status != 200 or not isinstance(agreements, Mapping)
+                                    or agreements.get("consentRequired") is not False):
+                                return _gate("consent_required", http_status=403)
+                        else:
+                            return _gate("consent_required", http_status=403)
+                    status, auth_state = await api.raw_request("GET", "/api/auth/state", timeout=5)
+                    if status == 401 and not attempt:
+                        continue
+                    if status != 200:
+                        return _gate(rejection_code(status, auth_state), http_status=status)
+                    if not isinstance(auth_state, Mapping) or type(auth_state.get("mustChangePassword")) is not bool:
+                        return _gate("unavailable")
+                    return _gate("password_change_required" if auth_state["mustChangePassword"] else "ready",
+                                 http_status=403 if auth_state["mustChangePassword"] else 200)
+                return _gate("auth_required", http_status=401)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return _gate("unavailable")
+
+        task = asyncio.create_task(check())
+        manager._mover_send_gate_task = task
+    result = await asyncio.shield(task)
+    manager._mover_send_gate = (getattr(manager, "api", None), time.monotonic(), result)
+    return dict(result)
+
+
+class QQDeliveryUncertain(QQSendError):
+    """A send was attempted but its outcome cannot be safely retried.
+
+    A lost response does not mean QQ did not receive the message. The caller
+    must retain its de-duplication key instead of automatically sending again.
+    """
 
 
 def has_forward_segments(segments: Any) -> bool:
@@ -51,7 +192,9 @@ async def expand_forward_segments(segments: list, bot: Any, account_id: str) -> 
                     response = await bot.call_action("get_forward_msg", self_id=account_id, id=key)
                     if isinstance(response, dict) and isinstance(response.get("data"), dict):
                         response = response["data"]
-                    nodes = response.get("messages") if isinstance(response, dict) else None
+                    # OneBot 11 specifies singular `message`; SnowLuma and
+                    # other adapters also return the established plural form.
+                    nodes = response.get("messages", response.get("message")) if isinstance(response, dict) else None
                     if not isinstance(nodes, list):
                         raise ValueError("QQ 合并转发未返回可读取的聊天记录")
                     snapshots[key] = nodes
@@ -183,7 +326,33 @@ async def _snowluma_api(context: Any) -> Any | None:
     api = getattr(manager, "api", None)
     if not callable(getattr(api, "raw_request", None)):
         raise QQSendError("SnowLuma 管理器的已认证会话尚未就绪，未切换其他发送通道。")
-    return api
+    gate = await snowluma_send_gate(manager)
+    if not gate["send_ready"]:
+        raise QQSendBlocked("QQ 发送条件未就绪，消息保留在本地等待处理。",
+                            code=gate["send_state"], http_status=gate["http_status"])
+    return manager.api
+
+
+async def qq_send_gate(context: Any) -> dict:
+    """Account-independent gate; account/membership checks still precede sends."""
+    try:
+        await _snowluma_api(context)
+    except QQSendBlocked as exc:
+        return _gate(exc.code, http_status=exc.http_status)
+    except QQSendError:
+        return _gate("unavailable")
+    return _gate("ready")
+
+
+def _explicit_onebot_rejection(payload: Any) -> bool:
+    if not isinstance(payload, Mapping) or payload.get("status") != "failed":
+        return False
+    code = payload.get("retcode")
+    data = payload.get("data")
+    if isinstance(data, Mapping) and data.get("message_id") not in (None, "", 0, "0"):
+        # A failure body carrying a receipt contradicts itself.
+        return False
+    return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
 
 async def _send_through_snowluma(api: Any, identity: str, action: str, params: dict) -> Mapping:
@@ -196,19 +365,43 @@ async def _send_through_snowluma(api: Any, identity: str, action: str, params: d
     except Exception as exc:
         # Manager errors may contain session credentials or raw submitted media.
         # A failed request must not become a second send through another transport.
-        raise QQSendError("SnowLuma 发送请求未确认成功，未切换其他通道重发。") from exc
+        raise QQDeliveryUncertain("SnowLuma 发送结果未知，已停止自动重发以避免重复消息。") from exc
     if not isinstance(response, tuple) or len(response) != 2:
-        raise QQSendError("SnowLuma 发送响应格式无效，未切换其他通道重发。")
+        raise QQDeliveryUncertain("SnowLuma 发送响应格式无效，无法确认发送结果。")
     status, payload = response
-    if not isinstance(status, int) or isinstance(status, bool) or status != 200 or not isinstance(payload, Mapping):
-        raise QQSendError("SnowLuma 发送接口未返回成功响应，未切换其他通道重发。")
+    if not isinstance(status, int) or isinstance(status, bool):
+        raise QQDeliveryUncertain("SnowLuma 发送接口未返回有效状态，无法确认发送结果。")
+    # These client errors reject the request before invoking QQ. A timeout or
+    # gateway/server error can happen after execution, so it remains uncertain.
+    if status in {400, 401, 403, 404, 405, 413, 415, 422, 429}:
+        code = rejection_code(status, payload)
+        error = QQSendBlocked if code in {"consent_required", "password_change_required", "auth_required"} else QQSendError
+        raise error("SnowLuma 发送接口已拒绝本次请求。", code=code, http_status=status)
+    if status != 200 or not isinstance(payload, Mapping):
+        raise QQDeliveryUncertain("SnowLuma 发送接口未返回可确认的结果。")
     retcode = payload.get("retcode")
+    if _explicit_onebot_rejection(payload):
+        raise QQSendError("SnowLuma OneBot 已明确拒绝本次发送。", code="onebot_rejected", http_status=200)
     if payload.get("status") != "ok" or not isinstance(retcode, int) or isinstance(retcode, bool) or retcode != 0:
-        raise QQSendError("SnowLuma OneBot 未确认发送成功，未切换其他通道重发。")
+        raise QQDeliveryUncertain("SnowLuma OneBot 未返回可确认的发送结果。")
     result = payload.get("data")
     if not isinstance(result, Mapping):
-        raise QQSendError("SnowLuma OneBot 未返回消息回执数据，未切换其他通道重发。")
+        raise QQDeliveryUncertain("SnowLuma OneBot 未返回消息回执数据，无法确认发送结果。")
     return result
+
+
+def _onebot_send_error(exc: Exception) -> QQSendError:
+    try:
+        from aiocqhttp.exceptions import ActionFailed, ApiNotAvailable
+    except ImportError:  # The standalone workbench does not import AstrBot.
+        pass
+    else:
+        # aiocqhttp 1.4.4 raises this before a transport emits the action.
+        if isinstance(exc, ApiNotAvailable):
+            return QQSendError("OneBot 发送连接已经断开，未提交本次消息。")
+        if isinstance(exc, ActionFailed) and _explicit_onebot_rejection(exc.result):
+            return QQSendError("OneBot 已明确拒绝本次发送。")
+    return QQDeliveryUncertain("OneBot 发送结果未知，已停止自动重发以避免重复消息。")
 
 
 async def send_qq(context: Any, target_umo: str, chain: Any, runtime_status: Any, account_id: str = "", return_account: bool = False) -> str | tuple[str, str]:
@@ -248,16 +441,19 @@ async def send_qq(context: Any, target_umo: str, chain: Any, runtime_status: Any
     if api is not None:
         result = await _send_through_snowluma(api, identity, action, params)
     else:
-        result = await bot.call_action(action, self_id=identity, **params)
+        try:
+            result = await bot.call_action(action, self_id=identity, **params)
+        except Exception as exc:
+            raise _onebot_send_error(exc) from None
     raw_message_id = result.get("message_id") if isinstance(result, Mapping) else None
     # OneBot v11 uses a signed 32-bit message_id; negative IDs are valid.
     # Zero, missing IDs, and non-integer values do not prove delivery.
     message_id_int = 0
     if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool):
         message_id_int = raw_message_id
-    elif isinstance(raw_message_id, str) and re.fullmatch(r"[+-]?[0-9]+", raw_message_id):
+    elif isinstance(raw_message_id, str) and re.fullmatch(r"[+-]?[0-9]{1,10}", raw_message_id):
         message_id_int = int(raw_message_id)
-    if message_id_int == 0:
-        raise QQSendError("OneBot 没有返回有效的消息发送回执。")
+    if message_id_int == 0 or not -(2 ** 31) <= message_id_int < 2 ** 31:
+        raise QQDeliveryUncertain("OneBot 没有返回有效的消息发送回执，无法确认发送结果。")
     receipt = str(message_id_int)
     return (identity, receipt) if return_account else receipt

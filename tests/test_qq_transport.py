@@ -93,7 +93,17 @@ class QQTransportTests(unittest.IsolatedAsyncioTestCase):
         self.bot.call_action.assert_not_awaited()
 
     def attach_snowluma_manager(self, response=(200, {"status": "ok", "retcode": 0, "data": {"message_id": -456}})):
-        api = SimpleNamespace(raw_request=AsyncMock(return_value=response))
+        def request(method, path, **kwargs):
+            if (method, path) == ("GET", "/api/agreements"):
+                return 200, {"consentRequired": False}
+            if (method, path) == ("GET", "/api/auth/state"):
+                return 200, {"mustChangePassword": False}
+            self.assertEqual((method, path), ("POST", "/api/debug/invoke"))
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        api = SimpleNamespace(token="fixture", raw_request=AsyncMock(side_effect=request))
         plugin = SimpleNamespace(manager=SimpleNamespace(api=api))
         self.context.get_registered_star = lambda name: SimpleNamespace(star_cls=plugin, activated=True) if name == "pulids_snowluma_go_to_astrbot" else None
         return api
@@ -107,7 +117,7 @@ class QQTransportTests(unittest.IsolatedAsyncioTestCase):
         state = {"qq": {"accounts": [account("111", ["10001"]), account("222", ["20002"])]}}
         result = await send_qq(self.context, "qq_bridge:GroupMessage:20002", object(), state, return_account=True)
         self.assertEqual(result, ("222", "-456"))
-        api.raw_request.assert_awaited_once_with(
+        api.raw_request.assert_awaited_with(
             "POST", "/api/debug/invoke",
             json_body={"uin": "222", "action": "send_group_msg", "params": {"group_id": 20002, "message": self.segments}},
             timeout=120,
@@ -143,12 +153,13 @@ class QQTransportTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(QQSendError) as caught:
                     await send_qq(self.context, "qq_bridge:FriendMessage:333", object(), None, account_id="111")
                 self.assertNotIn("fixture-private", str(caught.exception))
-                api.raw_request.assert_awaited_once()
+                self.assertEqual([call.args for call in api.raw_request.await_args_list], [
+                    ("GET", "/api/agreements"), ("GET", "/api/auth/state"), ("POST", "/api/debug/invoke"),
+                ])
         self.bot.call_action.assert_not_awaited()
 
     async def test_manager_network_failure_and_missing_session_do_not_switch_transport(self):
-        api = self.attach_snowluma_manager()
-        api.raw_request.side_effect = TimeoutError("fixture-private-session")
+        self.attach_snowluma_manager(TimeoutError("fixture-private-session"))
         with self.assertRaises(QQSendError) as caught:
             await send_qq(self.context, "qq_bridge:FriendMessage:333", object(), None, account_id="111")
         self.assertNotIn("fixture-private-session", str(caught.exception))

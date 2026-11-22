@@ -407,7 +407,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.context.sent), 1)
         self.assertEqual(self.context.sent[0][0], "aiocqhttp_main:FriendMessage:20002")
         echo = dict(message, msg_id="private-feishu-bridge-echo")
-        self.bridge.larkx_bridge._sent_ids.add("oc_1", echo["msg_id"])
+        self.bridge.larkx_bridge._sent_ids.add(self.bridge.larkx_bridge._receipt_scope("oc_1"), echo["msg_id"])
         await self.bridge.on_larkx_message(echo, "default", "bot-user")
         self.assertEqual(len(self.context.sent), 1)
         config["rules"][0]["include_self"] = False
@@ -450,8 +450,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(plugin.asyncio, "sleep", new=AsyncMock()) as sleep:
             with self.assertRaises(HTTPError):
                 await self.bridge._download_larkx_media(fetch, {"msg_id": "fixture"})
-        self.assertEqual(fetch.call_count, 4)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.3, 0.7, 1.2])
+        self.assertEqual(fetch.call_count, 6)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.3, 0.7, 1.2, 2.5, 5.0])
 
     async def test_unmapped_managed_message_is_stopped_before_astrbot_ai(self):
         event = FakeEvent(session_id="another-group")
@@ -852,16 +852,17 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.lark_deliveries, [])
         record.assert_called_once_with("feishu", False)
 
-    async def test_rich_post_retry_preserves_successful_prefix_and_deduplicates(self):
+    async def test_rich_post_retry_continues_remaining_parts_and_only_retries_the_failure(self):
         post = self.rich_post()
         with patch.object(plugin, "rich_post_parts", return_value=self.rich_parts(post)), patch.object(
-            self.bridge.larkx_bridge, "download_attachment", side_effect=[RuntimeError("resource not ready"), (b"video", "clip.mov", "video"), (b"video", "clip.mov", "video")]
-        ):
+            self.bridge.larkx_bridge, "download_attachment", side_effect=[RuntimeError("resource not ready"), (b"video", "clip.mov", "video")]
+        ) as download:
+            self.assertFalse(await self.bridge.on_larkx_message(post, "default", "bot-user"))
+            self.assertEqual([plugin.component_content_type(chain.chain[0]) for _, chain in self.context.sent], ["text", "text"])
+            self.assertTrue(await self.bridge.on_larkx_message(post, "default", "bot-user"))
             await self.bridge.on_larkx_message(post, "default", "bot-user")
-            self.assertEqual(len(self.context.sent), 1)
-            await self.bridge.on_larkx_message(post, "default", "bot-user")
-            await self.bridge.on_larkx_message(post, "default", "bot-user")
-        self.assertEqual([plugin.component_content_type(chain.chain[0]) for _, chain in self.context.sent], ["text", "video", "text"])
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual([plugin.component_content_type(chain.chain[0]) for _, chain in self.context.sent], ["text", "text", "video"])
 
     async def test_malformed_rich_media_records_failure_without_summary_text(self):
         post = self.rich_post()

@@ -5,6 +5,7 @@
     [switch]$NoBrowser,
     [switch]$SkipDesktopActions,
     [switch]$PrepareOnly,
+    [switch]$StartHere,
     [switch]$ResumeBackground
 )
 
@@ -45,6 +46,37 @@ function Find-RunningInstallation {
     return ''
 }
 
+function Get-OwnedWorkbench([switch]$AllowForeignPort) {
+    $port = 18766
+    $backgroundPath = Join-Path $TargetRoot 'runtime\background.settings.json'
+    if (Test-Path -LiteralPath $backgroundPath -PathType Leaf) {
+        $savedBackground = Get-Content -LiteralPath $backgroundPath -Raw | ConvertFrom-Json
+        if ($savedBackground.port) { $port = [int]$savedBackground.port }
+    }
+    if ($env:MOVER_WORKBENCH_PORT) { $port = [int]$env:MOVER_WORKBENCH_PORT }
+    if ($port -lt 1024 -or $port -gt 65535) { throw 'Invalid saved workbench port.' }
+    if (-not (Test-WorkbenchPort $port)) { return $null }
+    $url = "http://127.0.0.1:$port"
+    try {
+        $status = Invoke-RestMethod -Uri "$url/api/status" -TimeoutSec 2
+        if ($status.workbench_root -and ([IO.Path]::GetFullPath([string]$status.workbench_root).TrimEnd('\') -eq $TargetRoot)) {
+            return @{url=$url;port=$port;status=$status}
+        }
+    } catch { }
+    if ($AllowForeignPort) { return $null }
+    $message = "Port $port is occupied and does not identify this installation. No application files were changed."
+    if ($StartHere) {
+        # Match the native install launcher's visible port conflict message.
+        [Console]::Error.WriteLine($message)
+        exit 20
+    }
+    throw $message
+}
+
+if ($StartHere) {
+    if ($TargetRoot -or $PackagePath) { throw 'StartHere cannot be used with a separate target or package.' }
+    $TargetRoot = $sourceRoot
+}
 if (-not $TargetRoot) {
     if ($ResumeBackground) { $TargetRoot = $sourceRoot }
     else {
@@ -58,6 +90,24 @@ if (-not $TargetRoot) {
 }
 $TargetRoot = [IO.Path]::GetFullPath($TargetRoot).TrimEnd('\')
 if (-not (Test-Installation $TargetRoot)) { throw 'Target is not an existing Information Mover V2 installation.' }
+if ($StartHere) {
+    $backgroundPath = Join-Path $TargetRoot 'runtime\background.settings.json'
+    if (-not $env:MOVER_WORKBENCH_PORT -and -not (Test-Path -LiteralPath $backgroundPath) -and
+        (Test-WorkbenchPort 18766) -and -not (Get-OwnedWorkbench -AllowForeignPort)) {
+        foreach ($candidate in 18767..18786) {
+            $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $candidate)
+            try {
+                $listener.ExclusiveAddressUse = $true
+                $listener.Start()
+                $env:MOVER_WORKBENCH_PORT = [string]$candidate
+                Write-Output "Workbench port 18766 is occupied; using $candidate for this installation."
+                break
+            } catch [Net.Sockets.SocketException] { }
+            finally { $listener.Stop() }
+        }
+    }
+    $null = Get-OwnedWorkbench
+}
 
 $python = @(
     (Join-Path $TargetRoot 'runtime\.venv\Scripts\python.exe'),
@@ -95,26 +145,6 @@ $stopped = $false
 $supervisorStopped = $false
 $failed = $true
 
-function Get-OwnedWorkbench {
-    $port = 18766
-    $backgroundPath = Join-Path $TargetRoot 'runtime\background.settings.json'
-    if (Test-Path -LiteralPath $backgroundPath -PathType Leaf) {
-        $savedBackground = Get-Content -LiteralPath $backgroundPath -Raw | ConvertFrom-Json
-        if ($savedBackground.port) { $port = [int]$savedBackground.port }
-    }
-    if ($env:MOVER_WORKBENCH_PORT) { $port = [int]$env:MOVER_WORKBENCH_PORT }
-    if ($port -lt 1024 -or $port -gt 65535) { throw 'Invalid saved workbench port.' }
-    if (-not (Test-WorkbenchPort $port)) { return $null }
-    $url = "http://127.0.0.1:$port"
-    try {
-        $status = Invoke-RestMethod -Uri "$url/api/status" -TimeoutSec 2
-        if ($status.workbench_root -and ([IO.Path]::GetFullPath([string]$status.workbench_root).TrimEnd('\') -eq $TargetRoot)) {
-            return @{url=$url;port=$port;status=$status}
-        }
-    } catch { }
-    throw "Port $port is occupied and does not identify this installation. No application files were changed."
-}
-
 function Stop-ForUpdate($Owned) {
     if ($Owned -and $Owned.status.astrbot.running -and -not $Owned.status.astrbot.managed_here) {
         throw 'AstrBot is not owned by this workbench. Stop it before updating.'
@@ -146,6 +176,16 @@ function Start-Target([switch]$Quiet) {
     if ($LASTEXITCODE -ne 0) { throw 'Updated files are installed, but startup failed. Read runtime\logs.' }
 }
 
+function Restore-StoppedSupervisor {
+    if (-not $supervisorStopped) { return }
+    # Only restore the target watchdog actually stopped by this update. The helper
+    # re-reads saved preferences, including a manual opt-out made during startup.
+    try {
+        & $python @pythonArgs -B (Join-Path $sourceRoot 'background_runtime.py') ensure $TargetRoot
+        if ($LASTEXITCODE -ne 0) { throw 'Background recovery did not start.' }
+    } catch { Write-Warning ('Could not resume background recovery: ' + $_.Exception.Message) }
+}
+
 try {
     try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
     if (-not $locked) { throw 'An update is already running for this installation.' }
@@ -168,12 +208,26 @@ try {
         # Extracting onto the active directory changes files on disk, not the
         # Python code already imported by a running workbench.
         $owned = Get-OwnedWorkbench
-        if ($owned -and [string]$owned.status.version -ne [string]$verified.version) {
-            Stop-ForUpdate $owned
+        if ($owned) {
+            $loadedCurrent = $false
+            try {
+                $build = Invoke-RestMethod -Uri ($owned.url + '/api/diagnostics/build') -TimeoutSec 3
+                $loadedCurrent = $build.schema_version -eq 1 -and $build.workbench.matches -eq $true
+            } catch { }
+            if ([string]$owned.status.version -ne [string]$verified.version -or -not $loadedCurrent) {
+                Stop-ForUpdate $owned
+            }
         }
     }
-    New-Item -Path $registration -Force | Out-Null
-    New-ItemProperty -LiteralPath $registration -Name InstallRoot -Value $TargetRoot -PropertyType String -Force | Out-Null
+    $savedRoot = $null
+    if ($StartHere) {
+        $saved = Get-ItemProperty -LiteralPath $registration -Name InstallRoot -ErrorAction SilentlyContinue
+        $savedRoot = [string]$saved.InstallRoot
+    }
+    if (-not (Test-Installation $savedRoot)) {
+        New-Item -Path $registration -Force | Out-Null
+        New-ItemProperty -LiteralPath $registration -Name InstallRoot -Value $TargetRoot -PropertyType String -Force | Out-Null
+    }
     $failed = $false
 }
 finally {
@@ -187,10 +241,14 @@ finally {
     }
     if ($failed -and $supervisorStopped) {
         # Rollback can restore a start script that still has the old PowerShell quoting bug.
-        try {
-            & $python @pythonArgs -B (Join-Path $sourceRoot 'background_runtime.py') ensure $TargetRoot
-            if ($LASTEXITCODE -ne 0) { throw 'Background recovery did not start.' }
-        } catch { Write-Warning ('Could not resume background recovery: ' + $_.Exception.Message) }
+        Restore-StoppedSupervisor
     }
 }
-if (-not $NoStart) { Start-Target }
+if (-not $NoStart) {
+    try { Start-Target }
+    catch {
+        $startupFailure = $_
+        Restore-StoppedSupervisor
+        throw $startupFailure
+    }
+}

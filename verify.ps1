@@ -1,7 +1,9 @@
 ﻿$ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
-$pythonExe = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe'
+$pythonExe = $env:MOVER_VERIFY_PYTHON
+if (-not $pythonExe) { $pythonExe = Join-Path $projectRoot 'runtime\.venv\Scripts\python.exe' }
 if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
+    if ($env:MOVER_VERIFY_PYTHON) { throw 'MOVER_VERIFY_PYTHON must name an existing Python executable.' }
     $pythonExe = 'py'
     $pythonArgs = @('-3', '-B')
 }
@@ -11,18 +13,13 @@ else {
 
 Push-Location $projectRoot
 try {
+    $env:PYTHONUTF8 = '1'
     & $pythonExe @pythonArgs -m unittest discover -s tests -v
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 
-    $pythonFiles = @(
-        (Join-Path $projectRoot 'astrbot_plugin_message_bridge\bridge_core.py'),
-        (Join-Path $projectRoot 'astrbot_plugin_message_bridge\main.py'),
-        (Join-Path $projectRoot 'workbench_server.py')
-    )
-    $fileList = ($pythonFiles | ForEach-Object { "r'$_'" }) -join ','
-    & $pythonExe @pythonArgs -c "import ast, pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in [$fileList]]"
+    & $pythonExe @pythonArgs -c "import ast, pathlib; root=pathlib.Path.cwd(); files=[*root.glob('*.py'), *(root/'astrbot_plugin_message_bridge').glob('*.py')]; [ast.parse(p.read_text(encoding='utf-8-sig'), filename=str(p)) for p in files]; print(f'Parsed {len(files)} Python files.')"
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

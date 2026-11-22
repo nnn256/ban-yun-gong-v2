@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
@@ -23,12 +31,25 @@ from .bridge_core import (
     route_event_key,
 )
 from .larkx_bridge import LarkAgentXBridge
+from .larkx_inbox import RECOVERY_EPOCH
+from .event_log import install_loguru_compat
 from .runtime_status import RuntimeStatus
 from .larkx_media import NativeMediaDeliveryUncertain, attachment_bytes, attachment_filename, is_image_message, attachment_kind
-from .larkx_merge import is_merged_forward, merged_forward_parts
-from .larkx_richtext import is_rich_post, rich_post_parts
-from .qq_transport import expand_forward_segments, has_forward_segments, send_qq
+from .larkx_merge import is_merged_forward, is_system_message, merged_forward_parts
+from .larkx_richtext import has_inline_emotion, is_rich_post, rich_post_parts, rich_text_content
+from .qq_transport import (QQDeliveryUncertain, expand_forward_segments, has_forward_segments,
+                           install_onebot_result_guard, qq_send_gate, send_qq)
 from .qq_emojis import find_face_image
+from .build_identity import BRIDGE_VERSION, capture_module_build, loaded_modules
+
+
+MODULE_BUILD = capture_module_build(__file__)
+_LOADED_MODULES = loaded_modules(__package__, MODULE_BUILD)
+
+
+QQ_ALBUM_MAX_IMAGES = 8
+QQ_ALBUM_MAX_BYTES = 16 * 1024 * 1024
+RECEIPT_RETRY_SECONDS = 1.0
 
 
 def _emoji_image_component(component: Any) -> Any:
@@ -50,24 +71,33 @@ def _emoji_image_component(component: Any) -> Any:
     "astrbot_plugin_message_bridge",
     "搬运工V2",
     "在 AstrBot 的 QQ/OneBot 与飞书会话之间双向转发；不直接调用 AI。",
-    "2.0.9",
+    BRIDGE_VERSION,
 )
 class MessageBridge(Star):
     def __init__(self, context: Context) -> None:
         super().__init__(context)
+        install_loguru_compat()
+        install_onebot_result_guard()
+        self._chat_cache_lock = threading.RLock()
         self.data_dir = Path(StarTools.get_data_dir("astrbot_plugin_message_bridge"))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.data_dir / "bridge_rules.json"
         self.router = self._load_router()
         self._rules_signature = self._config_signature()
-        self.seen = SeenEvents()
-        self.sent_qq = SentMessageIds()
+        self.seen = SeenEvents(
+            ttl_seconds=7 * 86400, max_entries=100000,
+            path=self.data_dir / "delivery_seen.sqlite3",
+        )
+        self.sent_qq = SentMessageIds(
+            ttl_seconds=7 * 86400, max_entries=100000,
+            path=self.data_dir / "qq_receipts.sqlite3",
+        )
         self._qq_delivery_lock = asyncio.Lock()
         self._qq_self_event_handlers: dict[int, tuple[Any, Any, Any]] = {}
         self._larkx_envelopes_in_flight: set[str] = set()
         self._reported_sessions: set[str] = set()
         self.larkx_bridge = LarkAgentXBridge(self)
-        self.runtime_status = RuntimeStatus(context, self.data_dir, self.larkx_bridge)
+        self.runtime_status = RuntimeStatus(context, self.data_dir, self.larkx_bridge, build=_LOADED_MODULES)
         self._publish_routing_status()
         logger.info(
             "搬运工V2 已加载；配置文件: %s；受管平台: %s；有效规则: %s",
@@ -163,6 +193,47 @@ class MessageBridge(Star):
                        BridgeRouter({"managed_platforms": DEFAULT_MANAGED_PLATFORMS, "bridge_enabled": False}))
         self._publish_routing_status()
 
+    def larkx_recovery_chats(self, account_id: str) -> dict[str, str]:
+        self._reload_router_if_changed()
+        if not self.router.enabled:
+            return {}
+        grouped: dict[str, set[tuple]] = {}
+        for route in self.router.routes:
+            chat = route.source_session_id
+            if (not route.matches("larkx", account_id, route.source_message_type, chat)
+                    or not route.content_types
+                    or (route.target_umo.startswith("larkx:") and route.target_umo.split(":", 2)[-1] == chat)):
+                continue
+            grouped.setdefault(chat, set()).add((route.source_platform_id, route.source_message_type,
+                                                  route.target_umo, route.target_account_id,
+                                                  route.include_self, route.content_types))
+        return {chat: hashlib.sha256(json.dumps(sorted(rules), ensure_ascii=False).encode("utf-8")).hexdigest()
+                for chat, rules in grouped.items()}
+
+    async def larkx_send_gate(self, message: dict, account_id: str, *, include_mixed: bool = False) -> str:
+        """Do not spend finite retries on a known QQ permission gate."""
+        self._reload_router_if_changed()
+        if not self.router.enabled:
+            return ""
+        chat = str(message.get("chat_id") or "")
+        raw_type = message.get("chat_type")
+        kind = "GroupMessage" if raw_type in (2, 3, "2", "3") else "FriendMessage" if raw_type in (1, "1") else ""
+        own = str(message.get("from_id") or "") == str(self.larkx_bridge.user_id or "")
+        routes = [route for route in self.router.routes
+                  if route.source_platform == "larkx" and route.source_session_id == chat
+                  and (not route.source_platform_id or route.source_platform_id == account_id)
+                  and (not kind or route.source_message_type == kind)
+                  and (not own or route.include_self) and route.content_types
+                  and not (route.target_umo.startswith("larkx:") and route.target_umo.split(":", 2)[-1] == chat)]
+        if (not any(not route.target_umo.startswith("larkx:") for route in routes)
+                or not include_mixed and any(route.target_umo.startswith("larkx:") for route in routes)):
+            # A blocked QQ destination must not pause the same message's
+            # independent Feishu destination. Confirm it first, then defer
+            # only remaining QQ work under the original receipt identities.
+            return ""
+        gate = await qq_send_gate(self.context)
+        return "" if gate["send_ready"] else gate["send_state"]
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_platform_message(self, event: AstrMessageEvent) -> None:
         self._reload_router_if_changed()
@@ -200,9 +271,13 @@ class MessageBridge(Star):
         if not self.router.enabled:
             return
 
-        async with self._qq_delivery_lock:
-            if self.sent_qq.contains(platform_id, str(getattr(message_obj, "message_id", "")), source_account_id, session_id):
-                return
+        if platform == "aiocqhttp":
+            async with self._qq_delivery_lock:
+                if await asyncio.to_thread(
+                    self.sent_qq.contains, platform_id, str(getattr(message_obj, "message_id", "")),
+                    source_account_id, session_id,
+                ):
+                    return
 
         message_text = event.get_message_str() or ""
         routes = self.router.find_routes(
@@ -266,20 +341,146 @@ class MessageBridge(Star):
                         continue
                 await self._deliver_route_parts(route, route_chain, dedup_key)
 
-    async def _deliver_route_parts(self, route, chain: MessageChain, event_key: str) -> bool:
+    async def _deliver_route_parts(self, route, chain: MessageChain, event_key: str, *, trace_source: str = "",
+                                   can_submit: Callable[[], bool] | None = None) -> bool:
         route_key = route_event_key(event_key, route)
+        completed = True
         for index, component in enumerate(chain.chain):
             part_key = f"{route_key}:part:{index}"
-            if not self.seen.accept(part_key):
-                continue
             part = MessageChain()
             part.chain.append(component)
-            result = await self._deliver_chain(route, part)
-            if not result:
-                if result is False:
-                    self.seen.discard(part_key)
-                return False
-        return True
+            result = await self._deliver_reserved(part_key, route, part, can_submit=can_submit, trace_source=trace_source)
+            if result is False:
+                completed = False
+            # An unavailable part must not discard all subsequent pictures.
+            # Unknown receipts stay reserved and are never retried blindly.
+        return completed
+
+    async def _deliver_reserved(
+        self, key: str, route, chain: MessageChain, native_larkx_message_id: str = "", *,
+        can_submit: Callable[[], bool] | None = None, trace_source: str = "",
+    ) -> bool | None:
+        return await self._deliver_with_reservation([key], route, chain, native_larkx_message_id,
+                                                    can_submit=can_submit, trace_source=trace_source)
+
+    async def _has_delivery_receipt(self, key: str) -> bool:
+        # A read can wait behind a disk write in another worker. Keep it off
+        # the event loop that receives and acknowledges Feishu messages.
+        return await asyncio.to_thread(self.seen.contains, key)
+
+    async def _deliver_reserved_many(self, keys: list[str], route, chain: MessageChain, *,
+                                     can_submit: Callable[[], bool] | None = None) -> bool | None:
+        """Send an album once while retaining the original leaf identities."""
+        if len(keys) != len(chain.chain) or len(set(keys)) != len(keys):
+            raise ValueError("Album receipt keys must match its components")
+        return await self._deliver_with_reservation(keys, route, chain, can_submit=can_submit)
+
+    @staticmethod
+    async def _wait_delivery_task(task: asyncio.Task) -> tuple[Any, bool]:
+        """Let a running side effect settle, even after repeated caller cancellation."""
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+
+    async def _attempt_reserved_delivery(
+        self, keys: list[str], route, chain: MessageChain, native_larkx_message_id: str,
+        can_submit: Callable[[], bool] | None,
+    ) -> tuple[list[str], bool | None, bool, str]:
+        if can_submit is not None and not can_submit():
+            return [], True, False, "filtered"
+        reservation = asyncio.create_task(asyncio.to_thread(self.seen.reserve_many, keys))
+        accepted, cancelled = await self._wait_delivery_task(reservation)
+        if not accepted:
+            return [], True, cancelled, "duplicate"
+        if cancelled:
+            # A caller cancelled during a disk write has not submitted to QQ.
+            # Wait for ownership to be known and release the unsent reservation.
+            return accepted, False, True, "rejected"
+
+        if len(accepted) != len(keys):
+            # An overlapping album may have already sent some of these leaves.
+            owned = set(accepted)
+            selected = MessageChain()
+            selected.chain.extend(component for key, component in zip(keys, chain.chain) if key in owned)
+        else:
+            selected = chain
+        async def submit() -> tuple[bool, bool | None]:
+            # Rule and account changes can happen during download, while
+            # waiting in the QQ lane, or during the SQLite reservation.
+            if can_submit is not None and not can_submit():
+                return False, False
+            return True, await self._deliver_chain(route, selected, native_larkx_message_id=native_larkx_message_id)
+
+        delivery = asyncio.create_task(submit())
+        try:
+            (attempted, result), cancelled = await self._wait_delivery_task(delivery)
+        except asyncio.CancelledError:
+            # The transport task itself was interrupted; its remote outcome
+            # cannot be inferred from the cancellation.
+            return accepted, None, True, "uncertain"
+        state = "filtered" if not attempted else "confirmed" if result is True else "rejected" if result is False else "uncertain"
+        return accepted, result, cancelled, state
+
+    async def _deliver_with_reservation(
+        self, keys: list[str], route, chain: MessageChain, native_larkx_message_id: str = "", *,
+        can_submit: Callable[[], bool] | None = None, trace_source: str = "",
+    ) -> bool | None:
+        if not keys:
+            return True
+        if not chain.chain and not native_larkx_message_id:
+            return False
+        if route.target_umo.startswith("larkx:"):
+            accepted, result, cancelled, state = await self._attempt_reserved_delivery(
+                keys, route, chain, native_larkx_message_id, can_submit,
+            )
+        else:
+            # Waiting in line is cancellable and does not create a receipt.
+            # Hold the lane through the remote call and QQ echo registration.
+            async with self._qq_delivery_lock:
+                accepted, result, cancelled, state = await self._attempt_reserved_delivery(
+                    keys, route, chain, native_larkx_message_id, can_submit,
+                )
+        if accepted:
+            cancelled = await self._commit_delivery_outcome(accepted, result) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError
+        if trace_source:
+            target_ref = hashlib.sha256(keys[0].encode("utf-8")).hexdigest()[:16]
+            await self.trace_larkx("larkx_qq_delivery", state, source_ref=trace_source, target_ref=target_ref)
+        return True if state == "filtered" else result
+
+    async def _commit_delivery_outcome(self, keys: list[str], result: bool | None) -> bool:
+        """Settle a known remote result before completing its inbox item.
+
+        In particular, a transient disk error while releasing a *rejected*
+        send must not leave reserved keys that the next attempt mistakes for
+        accepted pictures. Retry local storage only; never repeat the send.
+        """
+        async def persist() -> None:
+            warned = False
+            while True:
+                try:
+                    if result is False:
+                        await asyncio.to_thread(self.seen.discard_many, keys)
+                    else:
+                        await asyncio.to_thread(self.seen.finish_many, keys, uncertain=result is None)
+                    return
+                except (sqlite3.Error, OSError) as exc:
+                    if not warned:
+                        try:
+                            self.log_larkx_error("本地转发回执暂时无法保存，等待存储恢复；未重新发送", exc)
+                        except Exception:
+                            pass
+                        warned = True
+                    await asyncio.sleep(RECEIPT_RETRY_SECONDS)
+
+        _, cancelled = await self._wait_delivery_task(asyncio.create_task(persist()))
+        return cancelled
 
     async def _deliver_chain(
         self, route, chain: MessageChain, native_larkx_message_id: str = ""
@@ -309,6 +510,30 @@ class MessageBridge(Star):
                     )
             else:
                 sent = await self._send_to_qq(route, chain)
+        except (NativeMediaDeliveryUncertain, QQDeliveryUncertain) as exc:
+            try:
+                self.runtime_status.record_delivery(delivery_platform, False)
+                self.runtime_status.events.write("send_uncertain", delivery_platform, False,
+                                                 error_type=type(exc).__name__)
+                self.log_larkx_error("发送结果未知；已保留去重记录，请核对目标会话", exc)
+            except Exception:
+                pass
+            return None
+        except Exception as exc:
+            try:
+                self.runtime_status.record_delivery(delivery_platform, False)
+                from .qq_transport import QQSendError
+                if isinstance(exc, QQSendError):
+                    self.runtime_status.events.write("send_rejected", delivery_platform, False,
+                                                     error_type=type(exc).__name__, error_code=exc.code,
+                                                     http_status=exc.http_status)
+                self.log_larkx_error("消息转发失败", exc)
+            except Exception:
+                pass
+            return False
+        # Diagnostic storage is separate from the delivery receipt. A status
+        # write failure after acceptance must never release the dedup key.
+        try:
             self.runtime_status.record_delivery(delivery_platform, bool(sent), str(sent) if isinstance(sent, str) else "")
             if not sent:
                 logger.error(
@@ -316,25 +541,26 @@ class MessageBridge(Star):
                     route.name,
                     route.target_umo,
                 )
-            return bool(sent)
-        except NativeMediaDeliveryUncertain as exc:
-            self.runtime_status.record_delivery(delivery_platform, False)
-            self.log_larkx_error("原生媒体发送结果未知；已保留去重记录以避免重复发送", exc)
-            return None
-        except Exception as exc:
-            self.runtime_status.record_delivery(delivery_platform, False)
-            self.log_larkx_error("消息转发失败", exc)
-            return False
+        except Exception:
+            pass
+        return bool(sent)
 
     async def _send_to_qq(self, route, chain: MessageChain) -> str:
-        async with self._qq_delivery_lock:
-            account_id, message_id = await send_qq(
-                self.context, route.target_umo, chain, self.runtime_status,
-                account_id=route.target_account_id, return_account=True,
+        # Caller owns the QQ lane until the echo receipt is visible.
+        account_id, message_id = await send_qq(
+            self.context, route.target_umo, chain, self.runtime_status,
+            account_id=route.target_account_id, return_account=True,
+        )
+        session_id = route.target_umo.split(":", 2)[2]
+        try:
+            await asyncio.to_thread(
+                self.sent_qq.add, route.target_umo.split(":", 1)[0], message_id, account_id, session_id,
             )
-            session_id = route.target_umo.split(":", 2)[2]
-            self.sent_qq.add(route.target_umo.split(":", 1)[0], message_id, account_id, session_id)
-            return message_id
+        except Exception as exc:
+            # The remote send has already been accepted. A local disk
+            # error cannot turn it into a safe-to-repeat send failure.
+            raise QQDeliveryUncertain("QQ 已接受消息，但本地回执未保存") from exc
+        return message_id
 
     async def _download_qq_record(self, event: AstrMessageEvent, component: Any) -> bytes:
         message_obj = getattr(event, "message_obj", None)
@@ -404,22 +630,76 @@ class MessageBridge(Star):
         logger.info("搬运工V2 LarkAgentX: %s", message)
 
     def log_larkx_error(self, message: str, error: Exception) -> None:
-        logger.warning("搬运工V2 LarkAgentX: %s (%s)", message, type(error).__name__)
+        from .qq_transport import QQSendError
+        if isinstance(error, QQSendError):
+            logger.warning("搬运工V2 LarkAgentX: %s (%s, code=%s, HTTP=%s)",
+                           message, type(error).__name__, error.code, error.http_status)
+        else:
+            logger.warning("搬运工V2 LarkAgentX: %s (%s)", message, type(error).__name__)
+
+    async def trace_larkx(self, action: str, state: str, message: dict | None = None, account_id: str = "", *,
+                          source_ref: str = "", target_ref: str = "", count: int = 1,
+                          content_type: str = "image") -> None:
+        try:
+            if message is not None:
+                source_ref = self._larkx_source_ref(message, account_id)
+            await self.runtime_status.record_larkx_trace(action, state=state, source_ref=source_ref,
+                                                         target_ref=target_ref, count=count, content_type=content_type)
+        except Exception:
+            pass
+
+    def _larkx_source_ref(self, message: dict, account_id: str) -> str:
+        return hashlib.sha256(self._larkx_event_key(message, account_id).encode("utf-8")).hexdigest()[:16]
 
     async def _download_larkx_media(self, method, message: dict) -> Any:
-        from requests.exceptions import HTTPError
+        from requests.exceptions import ConnectionError, HTTPError, Timeout
 
-        delays = (0.3, 0.7, 1.2)
+        delays = (0.3, 0.7, 1.2, 2.5, 5.0)
         for attempt in range(len(delays) + 1):
             try:
                 return await asyncio.to_thread(method, message)
-            except HTTPError as exc:
-                status = getattr(exc.response, "status_code", None)
-                transient = status in {404, 408, 425, 429} or isinstance(status, int) and 500 <= status <= 599
+            except (HTTPError, ConnectionError, Timeout) as exc:
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+                transient = (not isinstance(exc, HTTPError) or status in {404, 408, 425, 429}
+                             or isinstance(status, int) and 500 <= status <= 599)
                 if not transient or attempt == len(delays):
                     raise
-                # A pushed resource can become downloadable just after its event.
-                await asyncio.sleep(delays[attempt])
+                delay = delays[attempt]
+                # Honour bounded Retry-After seconds without trusting response
+                # bodies or unbounded server-supplied delays.
+                try:
+                    delay = max(delay, min(30.0, float(getattr(response, "headers", {}).get("Retry-After", 0))))
+                except (TypeError, ValueError):
+                    pass
+                self.runtime_status.events.write(
+                    "download_retry", "feishu", attempt=attempt + 1,
+                    error_type=type(exc).__name__, http_status=status or "",
+                    source_message_id=message.get("msg_id") or message.get("message_id") or "",
+                    chat_id=message.get("chat_id") or "",
+                )
+                await asyncio.sleep(delay)
+
+    @staticmethod
+    def _larkx_event_key(message: dict, account_id: str) -> str:
+        message_id = str(message.get("msg_id") or message.get("message_id") or "")
+        content = str(message.get("content") or "")
+        if not message_id:
+            # A batch can have identical placeholder text and timestamps. Its
+            # resource keys, rather than the shared placeholder, identify each
+            # separate image. Keep metadata only in a one-way hash.
+            media_identity = {
+                key: message[key] for key in ("msg_type", "content_data", "image_key", "file_key", "key")
+                if key in message
+            }
+            content += "\0" + hashlib.sha256(json.dumps(
+                media_identity, sort_keys=True, ensure_ascii=False, default=lambda value: repr(value),
+            ).encode("utf-8")).hexdigest()
+        return make_event_key(
+            f"larkx:{account_id}", str(message.get("chat_id") or ""), message_id,
+            str(message.get("from_id") or ""), content,
+            message.get("create_time") or message.get("timestamp") or "",
+        )
 
     @staticmethod
     def _larkx_content_type(message: dict) -> str:
@@ -459,7 +739,8 @@ class MessageBridge(Star):
                     chain.chain.append(File(name=filename, file=str(path)))
         return chain
 
-    async def _forward_larkx_parts(self, message: dict, routes: list, event_key: str, parse, label: str) -> None:
+    async def _forward_larkx_parts(self, message: dict, routes: list, event_key: str, parse, label: str, *,
+                                   can_submit: Callable[[], bool] | None = None) -> bool:
         # POST and MERGE_FORWARD are envelopes. Materialize the selected leaves
         # for both destinations so a video arrives as a native player message.
         try:
@@ -469,64 +750,177 @@ class MessageBridge(Star):
                 platform = "feishu" if route.target_umo.startswith("larkx:") else "qq"
                 self.runtime_status.record_delivery(platform, False)
             self.log_larkx_error(f"解析飞书{label}失败", exc)
-            return
+            return False
         chat_id = str(message.get("chat_id") or "")
         active = [route for route in routes if not (
             route.target_umo.startswith("larkx:") and route.target_umo.split(":", 2)[-1] == chat_id
         )]
-        for index, part in enumerate(parts):
-            if not active:
-                break
+        completed = True
+        index = 0
+        while index < len(parts):
+            part = parts[index]
+            # Album boundaries come from the original tree, before filtering
+            # by route or old receipts. Real merged chat records retain their
+            # individual child-message semantics.
+            if not is_merged_forward(message) and self._larkx_content_type(part) == "image":
+                end = index + 1
+                while end < len(parts) and self._larkx_content_type(parts[end]) == "image":
+                    end += 1
+                for offset in range(index, end, QQ_ALBUM_MAX_IMAGES):
+                    group = list(enumerate(parts[offset:min(offset + QQ_ALBUM_MAX_IMAGES, end)], offset))
+                    if not await self._forward_larkx_album_images(group, active, event_key, label, can_submit=can_submit):
+                        completed = False
+                index = end
+                continue
             kind = self._larkx_content_type(part)
-            selected = [route for route in active if kind in route.content_types]
+            rendered = ({route: rich_text_content(part, route.content_types) for route in active}
+                        if kind == "text" else {})
+            selected = [route for route in active if (rendered.get(route, "").strip() if kind == "text"
+                                                     else kind in route.content_types)]
             if not selected:
+                index += 1
                 continue
             part_key = f"{event_key}:envelope:{index}:{part.get('_rich_part_id', index)}"
             with TemporaryDirectory(prefix="mover-lark-part-") as directory:
                 chain = None
                 for route in selected:
                     key = route_event_key(part_key, route)
-                    if not self.seen.accept(key):
+                    if await self._has_delivery_receipt(key):
                         continue
                     try:
-                        if chain is None:
+                        if kind == "text":
+                            chain = MessageChain().message(rendered[route])
+                        elif chain is None:
                             chain = await self._larkx_part_chain(part, directory, index)
-                        sent = await self._deliver_chain(route, chain) if chain.chain else True
+                        # Reserve only once download/validation has succeeded;
+                        # a crash during a read cannot suppress an unsent image.
+                        sent = await self._deliver_reserved(key, route, chain, can_submit=can_submit) if chain.chain else True
                     except Exception as exc:
                         platform = "feishu" if route.target_umo.startswith("larkx:") else "qq"
                         self.runtime_status.record_delivery(platform, False)
                         self.log_larkx_error(f"飞书{label}内容转发失败", exc)
                         sent = False
                     if not sent:
-                        # Continue other targets, but don't send later parts ahead
-                        # of one that failed for this target.
-                        active.remove(route)
                         if sent is False:
-                            self.seen.discard(key)
+                            completed = False
+                        # Keep processing this batch's remaining pictures.
+                        # The inbox will retry only the failed leaves later.
+            index += 1
+        return completed
+
+    async def _forward_larkx_album_images(self, group: list[tuple[int, dict]], routes: list,
+                                         event_key: str, label: str, *,
+                                         can_submit: Callable[[], bool] | None = None) -> bool:
+        from astrbot.api.message_components import Image
+
+        selected = [route for route in routes if "image" in route.content_types]
+        if not selected:
+            return True
+        completed = True
+        pending: list[tuple[str, Any]] = []
+        pending_bytes = 0
+
+        async def flush() -> None:
+            nonlocal completed, pending_bytes
+            if not pending:
+                return
+            for route in selected:
+                leaves = []
+                for part_key, component in pending:
+                    key = route_event_key(part_key, route)
+                    if not await self._has_delivery_receipt(key):
+                        leaves.append((key, component))
+                if not leaves:
+                    continue
+                try:
+                    if route.target_umo.startswith("larkx:"):
+                        for key, component in leaves:
+                            chain = MessageChain()
+                            chain.chain.append(component)
+                            if await self._deliver_reserved(key, route, chain, can_submit=can_submit) is False:
+                                completed = False
+                    else:
+                        chain = MessageChain()
+                        chain.chain.extend(component for _, component in leaves)
+                        if await self._deliver_reserved_many([key for key, _ in leaves], route, chain, can_submit=can_submit) is False:
+                            completed = False
+                except Exception as exc:
+                    platform = "feishu" if route.target_umo.startswith("larkx:") else "qq"
+                    self.runtime_status.record_delivery(platform, False)
+                    self.log_larkx_error(f"飞书{label}多图转发失败", exc)
+                    completed = False
+            pending.clear()
+            pending_bytes = 0
+
+        for index, part in group:
+            part_key = f"{event_key}:envelope:{index}:{part.get('_rich_part_id', index)}"
+            needed = [route for route in selected
+                      if not await self._has_delivery_receipt(route_event_key(part_key, route))]
+            if not needed:
+                continue
+            try:
+                data = await self._download_larkx_media(self.larkx_bridge.download_image, part)
+                # At most one extra validated image is in memory while deciding
+                # a byte boundary. A legal large single image stays sendable.
+                if pending and pending_bytes + len(data) > QQ_ALBUM_MAX_BYTES:
+                    await flush()
+                component = Image.fromBytes(data)
+                pending.append((part_key, component))
+                pending_bytes += len(data)
+                if pending_bytes >= QQ_ALBUM_MAX_BYTES:
+                    await flush()
+            except Exception as exc:
+                for platform in {"feishu" if route.target_umo.startswith("larkx:") else "qq" for route in needed}:
+                    self.runtime_status.record_delivery(platform, False)
+                self.log_larkx_error(f"下载飞书{label}图片失败", exc)
+                completed = False
+                # Continue later leaves; no reservation exists for this failed
+                # download, so inbox recovery can retry just the missing image.
+        await flush()
+        return completed
 
     async def on_larkx_message(
         self, message: dict, account_id: str, user_id: str
-    ) -> None:
+    ) -> bool:
+        if is_system_message(message):
+            return True
+        routes = []
+        image_message = is_image_message(message)
+        source_ref = ""
         try:
             self._reload_router_if_changed()
             chat_id = str(message.get("chat_id") or "")
             if chat_id:
                 self._record_larkx_receive(chat_id, message)
+            if image_message:
+                source_ref = self._larkx_source_ref(message, account_id)
             if not self.router.enabled:
-                return
+                if source_ref:
+                    await self.trace_larkx("larkx_qq_route", "filtered", source_ref=source_ref)
+                return True
             message_id = str(message.get("msg_id") or message.get("message_id") or "")
             if await asyncio.to_thread(self.larkx_bridge.is_outgoing, chat_id, message_id):
-                return
+                if source_ref:
+                    await self.trace_larkx("larkx_qq_route", "echo", source_ref=source_ref)
+                return True
+            # The lookup above yields. Apply current routing, and reject an
+            # old recovery epoch before resolving any new destination.
+            self._reload_router_if_changed()
+            if not self.router.enabled or not self.larkx_bridge.recovery_message_current(message):
+                return True
+            can_submit = (partial(self.larkx_bridge.recovery_message_current, message)
+                          if message.get(RECOVERY_EPOCH) else None)
             content = str(message.get("content") or "")
             media_kind = attachment_kind(message)
-            image_message = is_image_message(message)
             sticker_message = media_kind == "sticker"
             rich_post = is_rich_post(message)
             merged = is_merged_forward(message)
-            if (not content.strip() and not image_message and not media_kind and not rich_post and not merged):
-                return
+            inline_emotion = not rich_post and not merged and has_inline_emotion(message)
+            if (not content.strip() and not image_message and not media_kind and not rich_post and not merged
+                    and not inline_emotion):
+                return True
             if not chat_id:
-                return
+                return True
             self._remember_larkx_chat(message, chat_id)
             raw_chat_type = message.get("chat_type", 0)
             if raw_chat_type in (2, 3, "2", "3"):
@@ -538,28 +932,43 @@ class MessageBridge(Star):
                               if route.source_platform == "larkx" and route.source_session_id == chat_id
                               and (not route.source_platform_id or route.source_platform_id == account_id)}
                 if len(configured) != 1:
-                    return
+                    return True
                 message_type = configured.pop()
             routes = self.router.find_routes(
                 "larkx", account_id, message_type, chat_id
             )
             own_message = str(message.get("from_id") or "") == str(user_id or "")
+            had_qq_route = any(not route.target_umo.startswith("larkx:") for route in routes)
             routes = [route for route in routes if not own_message or route.include_self]
+            if inline_emotion:
+                routes = [route for route in routes if {"text", "emoji"}.intersection(route.content_types)
+                          and not (route.target_umo.startswith("larkx:") and route.target_umo.split(":", 2)[-1] == chat_id)]
+                if not routes:
+                    return True
+                parts = rich_post_parts(message)
+                event_key = self._larkx_event_key(message, account_id)
+                complete = True
+                for route in routes:
+                    value = "".join(rich_text_content(part, route.content_types) for part in parts)
+                    if not value.strip():
+                        continue
+                    # Keep the same receipt identity as a normal TEXT message
+                    # across an upgrade or a repeated receive.
+                    key = f"{route_event_key(event_key, route)}:part:0"
+                    if await self._deliver_reserved(key, route, MessageChain().message(value), can_submit=can_submit) is False:
+                        complete = False
+                return complete
             if merged or rich_post:
                 if routes:
-                    dedup_key = make_event_key(
-                        f"larkx:{account_id}", chat_id, message_id,
-                        str(message.get("from_id") or ""), content,
-                        message.get("create_time") or message.get("timestamp") or "",
-                    )
+                    dedup_key = self._larkx_event_key(message, account_id)
                     if dedup_key not in self._larkx_envelopes_in_flight:
                         parse, label = (merged_forward_parts, "合并转发") if merged else (rich_post_parts, "富文本")
                         self._larkx_envelopes_in_flight.add(dedup_key)
                         try:
-                            await self._forward_larkx_parts(message, routes, dedup_key, parse, label)
+                            return await self._forward_larkx_parts(message, routes, dedup_key, parse, label, can_submit=can_submit)
                         finally:
                             self._larkx_envelopes_in_flight.discard(dedup_key)
-                return
+                return True
             source_content_type = (
                 "emoji" if sticker_message else
                 "image" if image_message else
@@ -567,14 +976,14 @@ class MessageBridge(Star):
                 "text"
             )
             routes = [route for route in routes if source_content_type in route.content_types]
+            if source_ref:
+                qq_routes = sum(not route.target_umo.startswith("larkx:") for route in routes)
+                await self.trace_larkx("larkx_qq_route", "matched" if qq_routes else
+                                       "filtered" if had_qq_route else "no_route",
+                                       source_ref=source_ref, count=qq_routes or 1)
             if not routes:
-                return
-            dedup_key = make_event_key(
-                f"larkx:{account_id}", chat_id,
-                str(message.get("msg_id") or message.get("message_id") or ""),
-                str(message.get("from_id") or ""), content,
-                message.get("create_time") or message.get("timestamp") or "",
-            )
+                return True
+            dedup_key = self._larkx_event_key(message, account_id)
             native_routes = []
             media_routes = []
             for route in routes:
@@ -585,15 +994,23 @@ class MessageBridge(Star):
                     native_routes.append(route)
                 else:
                     media_routes.append(route)
+            completed = True
             for route in native_routes:
                 route_key = route_event_key(dedup_key, route)
-                if not self.seen.accept(route_key):
-                    continue
-                sent = await self._deliver_chain(route, MessageChain(), native_larkx_message_id=message_id)
-                if not sent:
-                    self.seen.discard(route_key)
+                sent = await self._deliver_reserved(
+                    route_key, route, MessageChain(), native_larkx_message_id=message_id, can_submit=can_submit
+                )
+                if sent is False:
+                    completed = False
             if not media_routes:
-                return
+                return completed
+            # Ordinary Feishu messages produce a single component. A repeated
+            # push or recovered inbox item need not download accepted media.
+            media_routes = [route for route in media_routes if not await self._has_delivery_receipt(
+                f"{route_event_key(dedup_key, route)}:part:0"
+            )]
+            if not media_routes:
+                return completed
             with TemporaryDirectory(prefix="mover-receive-") as directory:
                 chain = MessageChain()
                 if image_message or sticker_message:
@@ -624,16 +1041,35 @@ class MessageBridge(Star):
                     route_chain = filter_message_chain(chain, route.content_types)
                     if not route_chain.chain:
                         continue
-                    await self._deliver_route_parts(route, route_chain, dedup_key)
+                    if not await self._deliver_route_parts(route, route_chain, dedup_key,
+                                                           trace_source=source_ref if target_platform != "larkx" else "",
+                                                           can_submit=can_submit):
+                        completed = False
+                return completed
         except Exception as exc:
-            self.runtime_status.record_delivery("qq", False)
+            destinations = {"feishu" if route.target_umo.startswith("larkx:") else "qq" for route in routes}
+            for destination in destinations:
+                self.runtime_status.record_delivery(destination, False)
+            if source_ref and "qq" in destinations:
+                await self.trace_larkx("larkx_qq_delivery", "prep_failed", source_ref=source_ref)
+            self.runtime_status.events.write(
+                "receive_failed", "feishu", False, error_type=type(exc).__name__,
+                source_message_id=message.get("msg_id") or message.get("message_id") or "",
+                chat_id=message.get("chat_id") or "",
+            )
             self.log_larkx_error("接收消息转发失败", exc)
+            return False
 
     def _record_larkx_receive(self, chat_id: str, message: dict) -> None:
         self.runtime_status.record_receive("feishu", chat_id)
 
     def _remember_larkx_chat(self, message: dict, chat_id: str) -> None:
+        with self._chat_cache_lock:
+            self._write_larkx_chat(message, chat_id)
+
+    def _write_larkx_chat(self, message: dict, chat_id: str) -> None:
         path = self.data_dir / "larkx_chats.json"
+        temp = path.with_name(path.name + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"chats": []}
             chats = data.get("chats", []) if isinstance(data, dict) else []
@@ -652,11 +1088,19 @@ class MessageBridge(Star):
             chats = [item for item in chats if not isinstance(item, dict) or item.get("chat_id") != chat_id]
             chats.append(entry)
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            temp = path.with_suffix(".tmp")
             temp.write_text(json.dumps({"chats": chats[-500:]}, ensure_ascii=False, indent=2), encoding="utf-8")
-            temp.replace(path)
+            for attempt in range(4):
+                try:
+                    temp.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.025 * (attempt + 1))
         except Exception as exc:
             self.log_larkx_error("保存会话列表失败", exc)
+        finally:
+            temp.unlink(missing_ok=True)
 
     async def terminate(self) -> None:
         self._restore_qq_self_message_handlers()

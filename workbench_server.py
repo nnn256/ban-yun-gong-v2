@@ -19,15 +19,30 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
-from log_store import append_log, query_logs, redact
+from log_store import append_log, query_logs, redact, export_logs
 import background_runtime
 
 from astrbot_plugin_message_bridge.bridge_core import (
     BridgeRouter,
     CONTENT_TYPE_ORDER,
     DEFAULT_CONTENT_TYPES,
+    read_delivery_stats,
     valid_umo,
 )
+from astrbot_plugin_message_bridge.larkx_inbox import read_inbox_stats, retry_failed_inbox
+from astrbot_plugin_message_bridge.event_log import safe_larkx_recovery_status
+from astrbot_plugin_message_bridge import build_identity
+
+
+WORKBENCH_VERSION = "2.0.15"
+_WORKBENCH_FILES = ("workbench_server.py", "background_runtime.py", "log_store.py")
+_WORKBENCH_LOADED_MODULES = {name: str(getattr(sys.modules.get(name[:-3]), "MODULE_BUILD", ""))
+                            for name in _WORKBENCH_FILES}
+_WORKBENCH_LOADED_MODULES["workbench_server.py"] = build_identity.capture_module_build(__file__)
+_WORKBENCH_PLUGIN_MODULES = ("build_identity.py", "bridge_core.py", "larkx_inbox.py")
+for _filename in _WORKBENCH_PLUGIN_MODULES:
+    _module = sys.modules.get(f"astrbot_plugin_message_bridge.{_filename[:-3]}")
+    _WORKBENCH_LOADED_MODULES[f"plugin/{_filename}"] = str(getattr(_module, "MODULE_BUILD", ""))
 
 
 ROOT = Path(__file__).resolve().parent
@@ -49,9 +64,13 @@ ASTRBOT_RUNNER = ROOT / "astrbot_runner.py"
 PLUGIN_NAME = "astrbot_plugin_message_bridge"
 PLUGIN_FILES = (
     "__init__.py",
+    "build_identity.py",
     "bridge_core.py",
     "bridge_rules.example.json",
     "larkx_bridge.py",
+    "larkx_inbox.py",
+    "larkx_history.py",
+    "larkx_receive.py",
     "larkx_media.py",
     "larkx_merge.py",
     "larkx_richtext.py",
@@ -72,7 +91,7 @@ MESSAGE_TYPES = {"GroupMessage", "FriendMessage"}
 INITIAL_PASSWORD_RE = re.compile(r"Initial password:\s*(\S+)", re.IGNORECASE)
 
 _runtime_lock = threading.Lock()
-_astrbot_start_lock = threading.Lock()
+_astrbot_start_lock = threading.RLock()
 _settings_lock = threading.RLock()
 _rules_lock = threading.Lock()
 _astrbot_process: subprocess.Popen[str] | None = None
@@ -308,9 +327,12 @@ _initial_password: str | None = _load_bootstrap_password()
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    temp = path.with_name(path.name + f".{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def load_settings() -> dict[str, Any]:
@@ -672,6 +694,14 @@ def install_plugin(root: Path) -> Path:
 
     target = plugin_destination(root)
     target.mkdir(parents=True, exist_ok=True)
+    changed = [name for name in PLUGIN_FILES
+               if not (target / name).is_file() or (target / name).read_bytes() != (PLUGIN_SOURCE / name).read_bytes()]
+    if changed:
+        # The later prepare pass cannot detect a copy that has already
+        # happened. Persist the restart obligation before replacing sources.
+        _atomic_json(rules_path(root).parent / "source-restart.pending.json",
+                     {"schema": 1, "generation": secrets.token_hex(16),
+                      "astrbot_root": str(root.resolve()), "changed_files": changed})
     for name in PLUGIN_FILES:
         (target / name).write_bytes((PLUGIN_SOURCE / name).read_bytes())
 
@@ -809,8 +839,22 @@ def _start_output_capture(process: subprocess.Popen[str], log_path: Path) -> Non
         append_log(log_path, line)
 
 
-def start_astrbot(reset_password: bool = False) -> dict[str, Any]:
+def start_astrbot(reset_password: bool = False, *, automatic_recovery: bool = False,
+                  respect_saved_desired: bool = False) -> dict[str, Any]:
     with _astrbot_start_lock:
+        if respect_saved_desired and not background_runtime.settings(ROOT)["astrbot_desired"]:
+            return {"started": False, "skipped": True, "reason": "manually_stopped"}
+        if automatic_recovery:
+            # An automatic request can arrive after the user pressed Stop. Read
+            # the desired state under the same lock used by manual start/stop.
+            desired = background_runtime.settings(ROOT)
+            if not desired["enabled"]:
+                return {"started": False, "skipped": True, "reason": "disabled"}
+            if not desired["astrbot_desired"]:
+                return {"started": False, "skipped": True, "reason": "manually_stopped"}
+            pause_reason = background_runtime.paused(ROOT)
+            if pause_reason:
+                return {"started": False, "skipped": True, "reason": "paused", "pause_reason": pause_reason}
         return _start_astrbot(reset_password)
 
 
@@ -894,6 +938,11 @@ def _start_astrbot(reset_password: bool) -> dict[str, Any]:
 
 
 def stop_astrbot() -> dict[str, Any]:
+    with _astrbot_start_lock:
+        return _stop_astrbot()
+
+
+def _stop_astrbot() -> dict[str, Any]:
     global _astrbot_process
     with _runtime_lock:
         process = _astrbot_process
@@ -1155,46 +1204,122 @@ def _snowluma_first_run_pending() -> bool:
     return False
 
 
-def read_runtime_status() -> dict[str, Any]:
+def _read_runtime_document() -> tuple[dict, bool]:
     path = rules_path(astrbot_root()).parent / "current_runtime_status.json"
     try:
+        if path.stat().st_size > 8 * 1024 * 1024:
+            return {}, False
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}, False
         updated = datetime.fromisoformat(str(raw.get("updated_at", "")))
         age = (datetime.now(timezone.utc) - updated).total_seconds()
-        fresh = 0 <= age <= 40
+        return raw, 0 <= age <= 40
     except (OSError, ValueError, TypeError, AttributeError):
+        return {}, False
+
+
+def _status_map(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _status_list(value: Any, limit: int) -> list:
+    return value[:limit] if isinstance(value, list) else []
+
+
+def _status_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def read_runtime_status() -> dict[str, Any]:
+    raw, fresh = _read_runtime_document()
+    if not raw:
         return {"available": False, "stale": True, "qq": {}, "feishu": {}, "snowluma": {}}
-    result = {"available": True, "stale": not fresh, "updated_at": raw.get("updated_at")}
+    result = {"available": True, "stale": not fresh, "updated_at": raw.get("updated_at"),
+              "bridge_build": build_identity.safe_runtime_identity(raw.get("bridge_build"))}
     for platform in ("qq", "feishu"):
-        source = raw.get(platform, {})
+        source = _status_map(raw.get(platform))
         result[platform] = {
             "state": str(source.get("state") or "unknown") if fresh else "stale",
             "connected": bool(source.get("connected")) and fresh,
             "identity_verified": bool(source.get("identity_verified")) and fresh,
-            "received_count": max(0, int(source.get("received_count") or 0)),
+            "received_count": _status_count(source.get("received_count")),
             "last_received_at": str(source.get("last_received_at") or ""),
             "last_chat_id": str(source.get("last_chat_id") or ""),
-            "sent_count": max(0, int(source.get("sent_count") or 0)),
-            "failed_count": max(0, int(source.get("failed_count") or 0)),
+            "sent_count": _status_count(source.get("sent_count")),
+            "failed_count": _status_count(source.get("failed_count")),
             "last_sent_at": str(source.get("last_sent_at") or ""),
             "last_failed_at": str(source.get("last_failed_at") or ""),
             "last_send_status": str(source.get("last_send_status") or ""),
         }
+    recovery = _status_map(raw.get("feishu")).get("recovery")
+    if isinstance(recovery, dict):
+        result["feishu"]["recovery"] = safe_larkx_recovery_status(recovery)
+        if not fresh:
+            result["feishu"]["recovery"]["state"] = "stale"
     result["qq"]["accounts"] = []
-    for account in raw.get("qq", {}).get("accounts", [])[:20]:
+    for account in _status_list(_status_map(raw.get("qq")).get("accounts"), 20):
         if not isinstance(account, dict):
             continue
         safe = {key: str(account.get(key) or "")[:160] for key in ("platform_id", "state", "user_id", "nickname", "groups_status", "checked_at")}
         safe.update(connected=bool(account.get("connected")) and fresh, identity_verified=bool(account.get("identity_verified")) and fresh)
-        safe["groups"] = [{"group_id": str(group.get("group_id") or ""), "group_name": str(group.get("group_name") or "")[:120]} for group in account.get("groups", []) if isinstance(group, dict) and group.get("group_id")][:3000]
+        safe["groups"] = [{"group_id": str(group.get("group_id") or ""), "group_name": str(group.get("group_name") or "")[:120]} for group in _status_list(account.get("groups"), 3000) if isinstance(group, dict) and group.get("group_id")]
         result["qq"]["accounts"].append(safe)
-    result["feishu"].update({key: str(raw.get("feishu", {}).get(key) or "")[:160] for key in ("user_id", "account_id")})
-    snow = raw.get("snowluma", {})
-    result["snowluma"] = {key: snow.get(key) if fresh and isinstance(snow.get(key), bool) else None for key in ("installed", "running", "auth_ok", "consent_required")}
+    result["feishu"].update({key: str(_status_map(raw.get("feishu")).get(key) or "")[:160] for key in ("user_id", "account_id")})
+    snow = _status_map(raw.get("snowluma"))
+    result["snowluma"] = {key: snow.get(key) if fresh and isinstance(snow.get(key), bool) else None for key in ("installed", "running", "auth_ok", "consent_required", "must_change_password", "send_ready")}
+    send_state = snow.get("send_state")
+    result["snowluma"]["send_state"] = send_state if fresh and send_state in {"ready", "consent_required", "password_change_required", "auth_required", "account_offline", "rate_limited", "unavailable"} else "unavailable"
+    result["snowluma"]["send_checked_at"] = _status_count(snow.get("send_checked_at")) if fresh else 0
     port = snow.get("webui_port")
     result["snowluma"].update(state=str(snow.get("state") or "unknown") if fresh else "stale", webui_port=port if type(port) is int and 1024 <= port <= 65535 else None)
-    result["snowluma"]["accounts"] = [{"uin": str(account.get("uin") or ""), "nickname": str(account.get("nickname") or "")[:120]} for account in snow.get("accounts", []) if isinstance(account, dict) and account.get("uin")][:20]
+    result["snowluma"]["accounts"] = [{"uin": str(account.get("uin") or ""), "nickname": str(account.get("nickname") or "")[:120]} for account in _status_list(snow.get("accounts"), 20) if isinstance(account, dict) and account.get("uin")]
     return result
+
+
+def bridge_build_status(runtime: dict | None = None) -> dict[str, Any]:
+    if runtime is None:
+        raw, fresh = _read_runtime_document()
+        runtime = {"stale": not fresh, "bridge_build": raw.get("bridge_build")}
+    root = astrbot_root()
+    expected = build_identity.expected_modules(PLUGIN_SOURCE)
+    installed = build_identity.expected_modules(plugin_destination(root))
+    complete = all(expected.values())
+    installed_matches = complete and installed == expected
+    record = build_identity.safe_runtime_identity(runtime.get("bridge_build"))
+    result = {"state": "unavailable", "matches": False, "runtime": None,
+              "expected": {"version": WORKBENCH_VERSION,
+                           "modules_fingerprint": build_identity.fingerprint(expected) if complete else ""},
+              "installed_matches": installed_matches,
+              "restart_pending": (rules_path(root).parent / "source-restart.pending.json").is_file()}
+    if record is None:
+        return result
+    result["runtime"] = {key: record[key] for key in
+                         ("version", "process_id", "run_id", "modules_fingerprint", "loaded_at")}
+    if runtime.get("stale", True) or not record["running"] or not build_identity.process_matches(record, root):
+        result["state"] = "stale"
+    elif complete:
+        matches = record["modules"] == expected and installed_matches and record["version"] == WORKBENCH_VERSION
+        result.update(state="current" if matches else "mismatch", matches=matches,
+                      mismatched_files=[name for name in build_identity.CODE_FILES
+                                        if record["modules"].get(name) != expected[name] or installed[name] != expected[name]])
+    return result
+
+
+def build_diagnostics() -> dict[str, Any]:
+    """A shareable version check, deliberately independent of logs and bootstrap secrets."""
+    expected = build_identity.expected_modules(ROOT, _WORKBENCH_FILES)
+    expected.update({f"plugin/{name}": value for name, value in
+                     build_identity.expected_modules(PLUGIN_SOURCE, _WORKBENCH_PLUGIN_MODULES).items()})
+    matches = all(expected.values()) and expected == _WORKBENCH_LOADED_MODULES
+    return {"schema_version": 1,
+            "workbench": {"version": WORKBENCH_VERSION, "matches": matches,
+                          "modules_fingerprint": build_identity.fingerprint(_WORKBENCH_LOADED_MODULES),
+                          "expected_fingerprint": build_identity.fingerprint(expected)},
+            "plugin": bridge_build_status()}
 
 
 def _chat_type(value: Any) -> str:
@@ -1442,6 +1567,28 @@ def set_bridge_enabled(enabled: bool) -> dict[str, Any]:
     return {"enabled": saved["bridge_enabled"], "total": len(saved["rules"]), "active": sum(bool(rule.get("enabled", True)) for rule in saved["rules"])}
 
 
+def delivery_queue_status() -> dict[str, Any]:
+    directory = rules_path(astrbot_root()).parent
+    try:
+        return {"available": True,
+                **read_inbox_stats(directory / "larkx-inbox.sqlite3"),
+                "receipts": read_delivery_stats(directory / "delivery_seen.sqlite3")}
+    except Exception:
+        # Database details and pending message payloads remain local to the
+        # transport; the status endpoint only exposes aggregate counts.
+        return {"available": False, "pending": 0, "processing": 0, "failed": 0, "done": 0,
+                "receipts": {"sent": 0, "uncertain": 0}}
+
+
+def retry_delivery_queue() -> dict[str, Any]:
+    directory = rules_path(astrbot_root()).parent
+    try:
+        count = retry_failed_inbox(directory / "larkx-inbox.sqlite3")
+    except Exception as exc:
+        raise ValueError("无法读取本地失败队列，请导出诊断日志") from exc
+    return {"queued": count}
+
+
 def get_status() -> dict[str, Any]:
     settings = load_settings()
     root = astrbot_root(settings)
@@ -1478,7 +1625,7 @@ def get_status() -> dict[str, Any]:
         "settings": settings,
         "workbench_root": str(ROOT),
         "workbench_pid": os.getpid(),
-        "version": "2.0.9",
+        "version": WORKBENCH_VERSION,
         "background": background_runtime.status(ROOT),
         "astrbot": {
             "installed": ASTRBOT_EXE.is_file(),
@@ -1492,6 +1639,7 @@ def get_status() -> dict[str, Any]:
         "plugin": {
             "installed": plugin_installed,
             "config_path": str(rules_path(root)),
+            "build": bridge_build_status(runtime),
         },
         "snowluma_plugin": {
             "installed": (
@@ -1501,6 +1649,7 @@ def get_status() -> dict[str, Any]:
         },
         "larkagentx": larkx,
         "runtime": runtime,
+        "delivery_queue": delivery_queue_status(),
         "snowluma": {
             "installed": snow.get("installed"),
             "running": snow.get("running"),
@@ -1664,12 +1813,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, integration_status())
         elif path == "/api/status":
             self._json(200, get_status())
+        elif path == "/api/diagnostics/build":
+            self._json(200, build_diagnostics())
         elif path == "/api/logs":
             try:
                 params = {key: values[-1] for key, values in parse_qs(urlparse(self.path).query).items()}
                 self._json(200, query_logs(ROOT, astrbot_root(), params))
             except (ValueError, OSError) as exc:
                 self._json(400, {"error": str(exc)})
+        elif path == "/api/logs/export":
+            try:
+                self._send_bytes(200, export_logs(ROOT, astrbot_root()), "application/zip")
+            except (ValueError, OSError):
+                self._json(500, {"error": "诊断日志导出失败，请稍后重试"})
         elif path == "/api/larkagentx/status":
             self._json(200, larkx_status())
         elif path == "/api/larkagentx/qr/status":
@@ -1723,23 +1879,28 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     raise ValueError(f"读取飞书会话失败（{type(exc).__name__}）；本机映射与凭证保持不变。") from exc
             elif path == "/api/astrbot/start":
-                result = start_astrbot(bool(data.get("reset_password", False)))
-                if not data.get("preserve_background"):
-                    background_runtime.set_desired(ROOT, astrbot_desired=True)
+                automatic_recovery = data.get("automatic_recovery") is True
+                respect_saved_desired = data.get("respect_saved_desired") is True
+                with _astrbot_start_lock:
+                    result = start_astrbot(bool(data.get("reset_password", False)), automatic_recovery=automatic_recovery,
+                                          respect_saved_desired=respect_saved_desired)
+                    if not automatic_recovery and not respect_saved_desired and not data.get("preserve_background"):
+                        background_runtime.set_desired(ROOT, astrbot_desired=True)
             elif path == "/api/astrbot/stop":
-                if not data.get("preserve_background"):
-                    background_runtime.set_desired(ROOT, astrbot_desired=False)
-                result = stop_astrbot()
+                with _astrbot_start_lock:
+                    if not data.get("preserve_background"):
+                        background_runtime.set_desired(ROOT, astrbot_desired=False)
+                    result = stop_astrbot()
             elif path == "/api/background/config":
-                result = background_runtime.configure(ROOT, data)
-                if result.get("enabled"):
-                    background_runtime.ensure_supervisor(ROOT, int(os.environ.get("MOVER_WORKBENCH_PORT", "18766")))
+                result = background_runtime.configure(ROOT, data, port=self.server.server_address[1])
             elif path == "/api/snowluma/start":
                 result = start_snowluma()
             elif path == "/api/snowluma/configure-onebot":
                 result = configure_snowluma_onebot()
             elif path == "/api/larkagentx/qr/start":
                 result = start_larkx_qr_login()
+            elif path == "/api/bridge/retry-failed":
+                result = retry_delivery_queue()
             elif path == "/api/bootstrap/clear":
                 global _initial_password
                 with _runtime_lock:
@@ -1783,13 +1944,33 @@ class Handler(BaseHTTPRequestHandler):
         return result
 
 
+def _ensure_background_guard(port: int) -> None:
+    """Start the guard for direct launches without blocking the local HTTP service."""
+    try:
+        background_runtime.ensure_settings(ROOT)
+        background_runtime.ensure_supervisor(ROOT, port)
+    except Exception as exc:
+        # Keep settings/status reachable when the guard cannot start. Do not log
+        # exception text: platform paths and process output may be private.
+        message = f"Background supervisor did not become ready ({type(exc).__name__}); check background status."
+        print(message, file=sys.stderr, flush=True)
+        try:
+            append_log(WORKBENCH_LOG, datetime.now(timezone.utc).isoformat(timespec="seconds") + " ERROR " + message)
+        except OSError:
+            pass
+
+
 def main() -> None:
     settings = load_settings()
-    port = int(os.environ.get("MOVER_WORKBENCH_PORT", "18766"))
+    port = int(os.environ.get("MOVER_WORKBENCH_PORT", str(background_runtime.settings(ROOT)["port"])))
     server = WorkbenchServer(("127.0.0.1", port), Handler)
     print(f"搬运工V2 工作台: http://127.0.0.1:{port}/", flush=True)
     print(f"AstrBot 目录: {settings['astrbot_root']}", flush=True)
     try:
+        # Launch only after this install owns its port. A separate thread lets
+        # the supervisor probe /api/status while startup waits for its heartbeat.
+        threading.Thread(target=_ensure_background_guard, args=(port,), daemon=True,
+                         name="mover-background-start").start()
         server.serve_forever()
     except KeyboardInterrupt:
         pass

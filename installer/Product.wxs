@@ -1,7 +1,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="搬运工V2"
            Manufacturer="搬运工V2"
-           Version="2.0.9"
+           Version="$(var.ReleaseVersion)"
            UpgradeCode="{D5231F74-AE3B-4A53-8C40-1D742FA9A391}"
            Scope="perUser">
     <SummaryInformation Description="QQ 与飞书本地消息转发工作台" Manufacturer="搬运工V2" />
@@ -18,12 +18,13 @@
                     Name="后台运行搬运工V2"
                     Description="隐藏启动消息转发与后台保活"
                     Target="[INSTALLFOLDER]mover-v2-launcher.exe"
+                    Arguments="--start-here"
                     WorkingDirectory="INSTALLFOLDER" />
           <Shortcut Id="OpenWorkbenchShortcut"
                     Name="打开搬运工V2工作台"
                     Description="打开扫码、转发规则和运行日志"
                     Target="[INSTALLFOLDER]mover-v2-launcher.exe"
-                    Arguments="--open"
+                    Arguments="--open --start-here"
                     WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
           <RegistryValue Root="HKCU" Key="Software\搬运工V2" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
@@ -36,7 +37,7 @@
                   Name="搬运工V2工作台"
                   Description="打开扫码、转发规则和运行日志"
                   Target="[INSTALLFOLDER]mover-v2-launcher.exe"
-                  Arguments="--open"
+                  Arguments="--open --start-here"
                   WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue Root="HKCU" Key="Software\搬运工V2" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>

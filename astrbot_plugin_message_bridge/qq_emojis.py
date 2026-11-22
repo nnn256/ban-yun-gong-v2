@@ -1,6 +1,10 @@
 """Resolve installed QQ system-face IDs to local image assets."""
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 import os
 import re
 from functools import cmp_to_key

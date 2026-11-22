@@ -1,6 +1,10 @@
 """Recover an observed native SnowLuma child through its existing owner."""
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 import asyncio
 import time
 

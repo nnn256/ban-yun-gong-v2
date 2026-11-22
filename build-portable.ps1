@@ -78,7 +78,7 @@ foreach ($license in @('LICENSE-APACHE', 'LICENSE-MIT')) {
 }
 
 $arguments = @(
-    '/nologo', '/target:winexe', '/optimize+',
+    '/nologo', '/target:winexe', '/platform:x64', '/codepage:65001', '/optimize+',
     '/reference:System.Windows.Forms.dll',
     "/out:$OutputExe",
     (Join-Path $PSScriptRoot 'portable_launcher.cs')

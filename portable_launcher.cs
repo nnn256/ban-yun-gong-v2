@@ -16,6 +16,7 @@ internal static class PortableLauncher
         string root = AppDomain.CurrentDomain.BaseDirectory;
         string script = Path.Combine(root, "update-and-start.ps1");
         bool openWorkbench = Array.IndexOf(args, "--open") >= 0;
+        bool startHere = Array.IndexOf(args, "--start-here") >= 0;
         bool resumeBackground = Array.IndexOf(args, "--resume-background") >= 0;
         bool completePayload = PayloadExists(root);
         if (args.Length > 0 && args[0] == "--check")
@@ -23,7 +24,7 @@ internal static class PortableLauncher
 
         if (!completePayload)
         {
-            string message = "安装包内容不完整。请完整解压新版 ZIP。";
+            string message = "程序文件不完整。请重新安装或完整解压下载的 ZIP。";
             if (openWorkbench) MessageBox.Show(message, "搬运工V2", MessageBoxButtons.OK, MessageBoxIcon.Error);
             else try
             {
@@ -63,6 +64,7 @@ internal static class PortableLauncher
                 FileName = powershell,
                 Arguments = "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + script + "\"" +
                     (openWorkbench ? "" : " -NoBrowser -SkipDesktopActions") +
+                    (startHere ? " -StartHere" : "") +
                     (resumeBackground ? " -ResumeBackground" : ""),
                 WorkingDirectory = root,
                 UseShellExecute = false,
@@ -95,6 +97,12 @@ internal static class PortableLauncher
                 if (process.ExitCode != 0)
                 {
                     WriteLog(log, "Startup failed; exit code: " + process.ExitCode);
+                    if (openWorkbench && process.ExitCode == 20)
+                    {
+                        MessageBox.Show("当前工作台端口被占用。请检查端口设置后重试。\n\n启动日志：" + logPath,
+                            "搬运工V2", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return process.ExitCode;
+                    }
                     if (openWorkbench) MessageBox.Show(
                         "搬运工V2未能启动。请查看启动日志：" + logPath + "\n\n退出代码：" + process.ExitCode,
                         "搬运工V2", MessageBoxButtons.OK, MessageBoxIcon.Error);

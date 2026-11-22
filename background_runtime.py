@@ -7,12 +7,18 @@ import ctypes
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 from typing import Any
+
+try:
+    MODULE_BUILD = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+except OSError:
+    MODULE_BUILD = ""
 
 DEFAULTS = {"enabled": True, "astrbot_desired": True, "keep_awake": True, "autostart": False, "port": 18766}
 
@@ -199,20 +205,44 @@ def autostart_registered(root: Path) -> bool:
 def status(root: Path) -> dict[str, Any]:
     result = settings(root)
     live = _read(_runtime(root) / "background.status.json")
-    alive = is_same_process(live.get("pid"), live.get("process_started_at"))
+    identity_verified = live.get("install_key") == _install_key(root)
+    # Legacy heartbeats still identify an existing process. Do not start a
+    # duplicate, but require a new-format heartbeat before declaring it ready.
+    compatible_identity = identity_verified or "install_key" not in live
+    alive = compatible_identity and is_same_process(live.get("pid"), live.get("process_started_at"))
     try:
         heartbeat = datetime.fromisoformat(str(live.get("heartbeat_at", "")).replace("Z", "+00:00"))
         heartbeat_age = (datetime.now(timezone.utc) - heartbeat.astimezone(timezone.utc)).total_seconds()
         fresh = -5 <= heartbeat_age <= 60
     except (ValueError, TypeError, OverflowError):
         fresh = False
+    if not result["enabled"] or not result["keep_awake"]:
+        power_state = "disabled"
+    elif not alive or live.get("state") == "stopped":
+        power_state = "not_running"
+    elif not fresh:
+        power_state = "not_responding"
+    elif not identity_verified:
+        power_state = "pending"
+    elif live.get("keep_awake_active") is True:
+        power_state = "active"
+    elif live.get("keep_awake_state") in ("failed", "unsupported"):
+        power_state = live["keep_awake_state"]
+    else:
+        power_state = "pending"
+    error_code = live.get("keep_awake_error_code")
+    if power_state != "failed" or type(error_code) is not int or not 0 <= error_code <= 0xFFFFFFFF:
+        error_code = None
     result.update({"running": alive, "heartbeat_at": live.get("heartbeat_at", ""),
                    "heartbeat_fresh": alive and fresh,
+                   "install_identity_verified": alive and identity_verified,
                    "pid": live.get("pid") if alive else None,
                    "state": (live.get("state", "starting") if fresh else "not_responding") if alive else "stopped",
                    "workbench_state": live.get("workbench_state", "unknown") if alive else "unknown",
                    "astrbot_state": live.get("astrbot_state", "unknown") if alive else "unknown",
-                   "keep_awake_active": alive and fresh and live.get("keep_awake_active") is True,
+                   "keep_awake_active": power_state == "active",
+                   "keep_awake_state": power_state,
+                   "keep_awake_error_code": error_code,
                    "restart_count": live.get("restart_count", 0),
                    "autostart_registered": autostart_registered(root),
                    "pause_reason": paused(root),
@@ -220,21 +250,61 @@ def status(root: Path) -> dict[str, Any]:
     return result
 
 
-def ensure_supervisor(root: Path, port: int | None = None) -> dict[str, Any]:
+def ensure_supervisor(root: Path, port: int | None = None, *, timeout: float = 8.0) -> dict[str, Any]:
+    """Confirm a live, installation-owned heartbeat, not merely a spawned PID.
+
+    A missing power request is reported in the returned status; it does not
+    prevent an otherwise healthy watchdog from supervising the application.
+    """
+    if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("后台守护等待时间必须是有限的非负秒数")
+    root = Path(root).resolve()
     if port is not None and port != settings(root)["port"]:
         set_desired(root, port=port)
     current = status(root)
     if current["autostart"] and not current["autostart_registered"]:
         configure_autostart(root, True)
-    if not current["running"] and current["enabled"]:
+    if not current["enabled"]:
+        return current
+
+    def ready(value: dict[str, Any]) -> bool:
+        return (value["running"] and value["heartbeat_fresh"] and
+                value.get("install_identity_verified") is True and value["state"] != "stopped")
+
+    if ready(current):
+        return current
+    child = None
+    exited_at = None
+    if not current["running"]:
         python = Path(root) / "runtime/.venv/Scripts/python.exe"
         if not python.is_file():
             python = Path(sys.executable)
         kwargs: dict[str, Any] = {"cwd": str(root), "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-        subprocess.Popen([str(python), str(Path(root) / "background_supervisor.py")], **kwargs)
-    return status(root)
+        child = subprocess.Popen([str(python), str(root / "background_supervisor.py")], **kwargs)
+    deadline = time.monotonic() + timeout
+    while True:
+        current = status(root)
+        if not current["enabled"] or ready(current):
+            return current
+        return_code = child.poll() if child is not None else None
+        now = time.monotonic()
+        if return_code not in (None, 0):
+            if exited_at is None:
+                exited_at = now
+            if now - exited_at >= 0.3 or now >= deadline:
+                raise OSError(f"后台守护启动后提前退出（退出代码 {return_code}）；请查看 runtime/logs/supervisor.log")
+        remaining = deadline - now
+        if remaining <= 0:
+            if return_code is not None:
+                # A second concurrent bootstrap may exit cleanly on the mutex;
+                # give the winner time to publish its own verified heartbeat.
+                raise OSError(f"后台守护已退出但未就绪（退出代码 {return_code}）；请查看 runtime/logs/supervisor.log")
+            if current["running"] and not current.get("install_identity_verified"):
+                raise TimeoutError("现有后台守护尚未提供本安装的有效心跳，请关闭旧版本后台进程后重新启动")
+            raise TimeoutError("后台守护在等待时间内未就绪；请查看 runtime/logs/supervisor.log")
+        time.sleep(min(0.1, remaining))
 
 
 def launch_workbench(root: Path, port: int, log_stem: str) -> subprocess.Popen:
@@ -266,7 +336,7 @@ def request_stop_supervisor(root: Path, timeout: float = 12) -> bool:
     return True
 
 
-def configure(root: Path, values: dict[str, Any]) -> dict[str, Any]:
+def configure(root: Path, values: dict[str, Any], *, port: int | None = None) -> dict[str, Any]:
     allowed = {"enabled", "keep_awake", "autostart"}
     if set(values) - allowed:
         raise ValueError("后台设置包含不支持的字段")
@@ -277,7 +347,7 @@ def configure(root: Path, values: dict[str, Any]) -> dict[str, Any]:
         configure_autostart(root, values["autostart"])
     set_desired(root, **values)
     if settings(root)["enabled"]:
-        ensure_supervisor(root)
+        return ensure_supervisor(root, port)
     return status(root)
 
 
@@ -303,7 +373,13 @@ def main() -> None:
         print(launch_workbench(args.root, args.port, f"workbench-{args.run_id}").pid)
     else:
         ensure_settings(args.root)
-        ensure_supervisor(args.root, args.port)
+        try:
+            result = ensure_supervisor(args.root, args.port)
+        except OSError as exc:
+            parser.exit(1, str(exc) + "\n")
+        if result["enabled"] and not (result["running"] and result["heartbeat_fresh"] and
+                                     result.get("install_identity_verified") is True and result["state"] != "stopped"):
+            parser.exit(1, "后台守护尚未就绪，请查看 runtime/logs/supervisor.log\n")
 
 
 if __name__ == "__main__":

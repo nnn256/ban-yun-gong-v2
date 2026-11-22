@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 from collections import OrderedDict
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
-from time import monotonic
-from typing import Any, Mapping
+from pathlib import Path
+import sqlite3
+from threading import RLock
+from time import monotonic, time as wall_time
+from typing import Any, Iterable, Mapping
 
 
 PLUGIN_ID = "astrbot_plugin_message_bridge"
@@ -183,13 +191,41 @@ class BridgeRouter:
 class SentMessageIds:
     """Track transport receipts so forwarded content needs no visible marker."""
 
-    def __init__(self, ttl_seconds: float = 600, max_entries: int = 5000) -> None:
+    def __init__(self, ttl_seconds: float = 600, max_entries: int = 5000, path: str | Path | None = None) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
         self._ids: OrderedDict[str, float] = OrderedDict()
+        self._path = Path(path) if path is not None else None
+        self._lock = RLock()
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._store() as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS sent_receipts (receipt_key TEXT PRIMARY KEY, sent_at REAL NOT NULL)")
+                connection.execute("CREATE INDEX IF NOT EXISTS sent_receipts_sent_at ON sent_receipts (sent_at)")
+                self._prune_store(connection, wall_time())
+                self._ids.update(connection.execute("SELECT receipt_key,sent_at FROM sent_receipts ORDER BY sent_at,rowid"))
+
+    @contextmanager
+    def _store(self):
+        connection = sqlite3.connect(self._path, timeout=10)
+        try:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+        finally:
+            connection.close()
+
+    def _prune_store(self, connection: sqlite3.Connection, current: float) -> None:
+        connection.execute("DELETE FROM sent_receipts WHERE sent_at <= ?", (current - self.ttl_seconds,))
+        excess = connection.execute("SELECT COUNT(*) FROM sent_receipts").fetchone()[0] - self.max_entries
+        if excess > 0:
+            connection.execute(
+                "DELETE FROM sent_receipts WHERE receipt_key IN (SELECT receipt_key FROM sent_receipts ORDER BY sent_at,rowid LIMIT ?)",
+                (excess,),
+            )
 
     def _prune(self) -> None:
-        cutoff = monotonic() - self.ttl_seconds
+        cutoff = (wall_time() if self._path is not None else monotonic()) - self.ttl_seconds
         while self._ids:
             key, at = next(iter(self._ids.items()))
             if at > cutoff and len(self._ids) <= self.max_entries:
@@ -201,44 +237,229 @@ class SentMessageIds:
             keys = [f"{platform_id}:{account_id}:{session_id}:{message_id}"]
             if session_id:
                 keys.append(f"{platform_id}:*:{session_id}:{message_id}")
-            for key in keys:
-                self._ids[key] = monotonic()
-                self._ids.move_to_end(key)
-            self._prune()
+            current = wall_time() if self._path is not None else monotonic()
+            with self._lock:
+                if self._path is not None:
+                    with self._store() as connection:
+                        connection.executemany("INSERT OR REPLACE INTO sent_receipts(receipt_key,sent_at) VALUES (?,?)",
+                                               [(key, current) for key in keys])
+                        self._prune_store(connection, current)
+                for key in keys:
+                    self._ids[key] = current
+                    self._ids.move_to_end(key)
+                self._prune()
 
     def contains(self, platform_id: str, message_id: str, account_id: str = "", session_id: str = "") -> bool:
-        self._prune()
+        if not message_id:
+            return False
         key = f"{platform_id}:{account_id}:{session_id}:{message_id}"
         cross_account_key = f"{platform_id}:*:{session_id}:{message_id}"
-        return bool(message_id) and (key in self._ids or (bool(session_id) and cross_account_key in self._ids))
+        with self._lock:
+            if self._path is not None:
+                with closing(sqlite3.connect(self._path, timeout=10)) as connection:
+                    keys = (key, cross_account_key) if session_id else (key, key)
+                    return connection.execute(
+                        "SELECT 1 FROM sent_receipts WHERE receipt_key IN (?,?) AND sent_at > ? LIMIT 1",
+                        (*keys, wall_time() - self.ttl_seconds),
+                    ).fetchone() is not None
+            self._prune()
+            return key in self._ids or (bool(session_id) and cross_account_key in self._ids)
 
 
 class SeenEvents:
-    """Bounded in-memory event de-duplication with a monotonic TTL."""
+    """Bounded event de-duplication, optionally retained across restarts.
 
-    def __init__(self, ttl_seconds: float = 600, max_entries: int = 5000) -> None:
+    In-memory instances use monotonic time. A persistent instance uses wall
+    time because a monotonic timestamp cannot be compared across reboots.
+    Store failures propagate instead of silently losing duplicate protection.
+    """
+
+    def __init__(self, ttl_seconds: float = 600, max_entries: int = 5000, path: str | Path | None = None) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
         self._seen: OrderedDict[str, float] = OrderedDict()
+        self._path = Path(path) if path is not None else None
+        self._lock = RLock()
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._store() as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS seen_events (event_key TEXT PRIMARY KEY, accepted_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'sent')")
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(seen_events)")}
+                if "state" not in columns:
+                    # Earlier versions only persisted a key after a send
+                    # attempt. Its result cannot safely be inferred on upgrade.
+                    connection.execute("ALTER TABLE seen_events ADD COLUMN state TEXT NOT NULL DEFAULT 'uncertain'")
+                # A process may stop between reserving a key and receiving a
+                # send response. Surface this condition for manual checking.
+                connection.execute("UPDATE seen_events SET state='uncertain' WHERE state='reserved'")
+                connection.execute("CREATE INDEX IF NOT EXISTS seen_events_accepted_at ON seen_events (accepted_at)")
+                self._expire_store(connection, wall_time())
+                self._prune_store_capacity(connection)
 
-    def accept(self, key: str, now: float | None = None) -> bool:
-        current = monotonic() if now is None else now
+    @contextmanager
+    def _store(self):
+        # Do not keep file handles open: workbench upgrades and Windows
+        # backups can copy this small database when no operation is running.
+        connection = sqlite3.connect(self._path, timeout=10)
+        try:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+        finally:
+            connection.close()
+
+    def _expire_store(self, connection: sqlite3.Connection, current: float) -> None:
+        connection.execute("DELETE FROM seen_events WHERE accepted_at <= ?", (current - self.ttl_seconds,))
+
+    def _prune_store_capacity(self, connection: sqlite3.Connection,
+                              protected_keys: frozenset[str] = frozenset()) -> None:
+        count = connection.execute("SELECT COUNT(*) FROM seen_events").fetchone()[0]
+        excess = count - self.max_entries
+        if excess > 0:
+            # A single outbound message may own several reservations. Never
+            # report those as reserved and then evict the beginning of that
+            # same message while bounding the receipt cache.
+            candidates = connection.execute("SELECT event_key FROM seen_events ORDER BY accepted_at, rowid")
+            removed = []
+            for (key,) in candidates:
+                if key not in protected_keys:
+                    removed.append((key,))
+                    if len(removed) == excess:
+                        break
+            connection.executemany("DELETE FROM seen_events WHERE event_key = ?", removed)
+
+    def _prune_memory(self, current: float) -> None:
         cutoff = current - self.ttl_seconds
         while self._seen:
             oldest_key, oldest_at = next(iter(self._seen.items()))
             if oldest_at > cutoff:
                 break
             self._seen.pop(oldest_key)
-        if key in self._seen:
-            self._seen.move_to_end(key)
-            return False
-        self._seen[key] = current
-        while len(self._seen) > self.max_entries:
-            self._seen.popitem(last=False)
-        return True
+
+    def accept(self, key: str, now: float | None = None) -> bool:
+        """Reserve one event, retaining the original single-key interface."""
+        return bool(self.reserve_many([key], now=now))
+
+    def reserve_many(self, keys: Iterable[str], now: float | None = None) -> list[str]:
+        """Atomically reserve missing leaves of one outbound message.
+
+        Existing sent, uncertain and active reservations all remain protected.
+        The returned keys are unique and retain input order. A caller must send
+        only those returned leaves and finish or release that entire set.
+        The database is the only authority for persistent instances. Database
+        failures roll back every insert and prune in the batch.
+        A batch larger than the cache capacity is rejected rather than partly
+        reserving it or returning keys that have already been evicted.
+        """
+        ordered = list(dict.fromkeys(keys))
+        if not ordered:
+            return []
+        current = (wall_time() if self._path is not None else monotonic()) if now is None else now
+        with self._lock:
+            if self._path is not None:
+                with self._store() as connection:
+                    self._expire_store(connection, current)
+                    accepted = []
+                    for key in ordered:
+                        if connection.execute(
+                            "INSERT OR IGNORE INTO seen_events (event_key, accepted_at, state) VALUES (?, ?, 'reserved')", (key, current)
+                        ).rowcount == 1:
+                            accepted.append(key)
+                    if len(accepted) > self.max_entries:
+                        raise ValueError("Receipt batch exceeds cache capacity")
+                    if accepted:
+                        self._prune_store_capacity(connection, frozenset(accepted))
+                return accepted
+            else:
+                cutoff = current - self.ttl_seconds
+                updated = OrderedDict((key, at) for key, at in self._seen.items() if at > cutoff)
+                accepted = [key for key in ordered if key not in updated]
+                if len(accepted) > self.max_entries:
+                    raise ValueError("Receipt batch exceeds cache capacity")
+                updated.update((key, current) for key in accepted)
+                protected = frozenset(accepted)
+                for key in list(updated):
+                    if len(updated) <= self.max_entries:
+                        break
+                    if key not in protected:
+                        updated.pop(key)
+            self._seen = updated
+            return accepted
+
+    def contains(self, key: str, now: float | None = None) -> bool:
+        """Check a receipt without reserving it or extending its lifetime.
+
+        Callers can avoid downloading an already delivered attachment before
+        using accept() to reserve it immediately before a real send attempt.
+        """
+        current = (wall_time() if self._path is not None else monotonic()) if now is None else now
+        with self._lock:
+            if self._path is not None:
+                connection = sqlite3.connect(self._path, timeout=10)
+                try:
+                    return connection.execute(
+                        "SELECT 1 FROM seen_events WHERE event_key = ? AND accepted_at > ?",
+                        (key, current - self.ttl_seconds),
+                    ).fetchone() is not None
+                finally:
+                    connection.close()
+            self._prune_memory(current)
+            return key in self._seen
+
+    def finish(self, key: str, *, uncertain: bool = False) -> None:
+        """Record a send result without releasing its duplicate protection.
+
+        A reservation that never reaches finish() is reported as uncertain
+        after a crash. Failures known to be unsent should use discard().
+        """
+        self.finish_many([key], uncertain=uncertain)
+
+    def finish_many(self, keys: Iterable[str], *, uncertain: bool = False) -> None:
+        """Commit one send result for all batch members, without new receipts."""
+        ordered = list(dict.fromkeys(keys))
+        if ordered and self._path is not None:
+            with self._lock, self._store() as connection:
+                connection.executemany("UPDATE seen_events SET state = ? WHERE event_key = ?",
+                                       [("uncertain" if uncertain else "sent", key) for key in ordered])
 
     def discard(self, key: str) -> None:
-        self._seen.pop(key, None)
+        self.discard_many([key])
+
+    def discard_many(self, keys: Iterable[str]) -> None:
+        """Release an explicitly unsent batch atomically for a later retry."""
+        ordered = list(dict.fromkeys(keys))
+        if not ordered:
+            return
+        with self._lock:
+            if self._path is not None:
+                with self._store() as connection:
+                    connection.executemany("DELETE FROM seen_events WHERE event_key = ?", [(key,) for key in ordered])
+            else:
+                for key in ordered:
+                    self._seen.pop(key, None)
+
+
+def read_delivery_stats(path: str | Path, ttl_seconds: float = 7 * 86400) -> dict[str, int]:
+    """Read privacy-safe receipt counts without modifying a live database."""
+    path = Path(path).resolve()
+    result = {"sent": 0, "uncertain": 0}
+    if not path.is_file():
+        return result
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(seen_events)")}
+        if not columns:
+            return result
+        if "state" not in columns:
+            # Legacy receipts did not distinguish success from an unfinished
+            # attempt; do not label these as confirmed success.
+            result["uncertain"] = connection.execute(
+                "SELECT COUNT(*) FROM seen_events WHERE accepted_at > ?", (wall_time() - ttl_seconds,)
+            ).fetchone()[0]
+            return result
+        for state, count in connection.execute(
+                "SELECT state, COUNT(*) FROM seen_events WHERE accepted_at > ? GROUP BY state", (wall_time() - ttl_seconds,)):
+            result["sent" if state == "sent" else "uncertain"] += count
+    return result
 
 
 def make_event_key(

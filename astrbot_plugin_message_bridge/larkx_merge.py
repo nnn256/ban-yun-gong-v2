@@ -1,12 +1,17 @@
 """Expand a Feishu merged chat record without relaying its display summary."""
 from __future__ import annotations
 
+from .build_identity import capture_module_build
+
+MODULE_BUILD = capture_module_build(__file__)
+
 from typing import Any
 
-from .larkx_richtext import is_rich_post, rich_post_parts
+from .larkx_richtext import has_inline_emotion, is_rich_post, rich_post_parts
 
 
 MERGE_TYPE = 11
+SYSTEM_TYPE = 6
 MAX_DEPTH = 8
 MAX_MESSAGES = 512
 MAX_CONTENT_BYTES = 16 * 1024 * 1024
@@ -16,6 +21,12 @@ SUPPORTED_TYPES = {2, 3, 4, 5, 7, 10, 15}
 def is_merged_forward(message: dict[str, Any]) -> bool:
     value = message.get("msg_type", message.get("message_type", ""))
     return str(value).lower() in {str(MERGE_TYPE), "merge_forward"}
+
+
+def is_system_message(message: dict[str, Any]) -> bool:
+    # SystemContent.typeNum is the notification subtype, not Message.Type.
+    value = message.get("msg_type", message.get("message_type", ""))
+    return str(value).lower() in {str(SYSTEM_TYPE), "system"}
 
 
 def merged_forward_parts(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -41,7 +52,15 @@ def merged_forward_parts(message: dict[str, Any]) -> list[dict[str, Any]]:
             seen_messages += 1
             if seen_messages > MAX_MESSAGES or not isinstance(child, dict):
                 raise ValueError("飞书合并转发消息数量或格式无效")
+            if child.get("isRemoved") is True:
+                continue
             kind = enum_to_int(child.get("type", 0))
+            if kind == SYSTEM_TYPE:
+                continue
+            if child.get("isTruncated") is True:
+                # The receiver hydrates the visible outer record first. Do
+                # not let a direct caller treat a preview as a complete child.
+                raise ValueError("飞书合并转发子消息尚未补全")
             if kind not in SUPPORTED_TYPES and kind != MERGE_TYPE:
                 continue
             path = f"{parent}{index}"
@@ -62,6 +81,10 @@ def merged_forward_parts(message: dict[str, Any]) -> list[dict[str, Any]]:
             if is_rich_post(part):
                 for leaf in rich_post_parts(part):
                     contents.append({**leaf, "_rich_part_id": f"{path}:{leaf['_rich_part_id']}"})
+            elif has_inline_emotion(part):
+                # A TEXT child still has one receipt at its original path.
+                (leaf,) = rich_post_parts(part)
+                contents.append({**leaf, "_rich_part_id": path})
             else:
                 contents.append(part)
             if len(contents) > MAX_MESSAGES:

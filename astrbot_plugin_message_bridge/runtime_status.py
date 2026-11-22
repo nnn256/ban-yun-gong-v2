@@ -8,8 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .event_log import EventLog
+from .event_log import EventLog, safe_larkx_recovery_status
 from .snowluma_watchdog import SnowLumaRecovery
+from .build_identity import capture_module_build, runtime_identity
+from .qq_transport import snowluma_send_gate
+
+
+MODULE_BUILD = capture_module_build(__file__)
 
 
 def utc_now() -> str:
@@ -21,7 +26,7 @@ def text(value: Any, limit: int = 200) -> str:
 
 
 class RuntimeStatus:
-    def __init__(self, context: Any, directory: Path, larkx: Any, *, interval: float = 7, timeout: float = 3) -> None:
+    def __init__(self, context: Any, directory: Path, larkx: Any, *, interval: float = 7, timeout: float = 3, build: dict | None = None) -> None:
         self.context = context
         self.path = Path(directory) / "current_runtime_status.json"
         self.events = EventLog(Path(directory))
@@ -31,6 +36,8 @@ class RuntimeStatus:
         self._task: asyncio.Task | None = None
         self._snowluma_recovery: SnowLumaRecovery | None = None
         self._lock = threading.RLock()
+        self._refresh_lock = asyncio.Lock()
+        self._refreshed_at = 0.0
         self._activity = {
             platform: {"received_count": 0, "last_received_at": "", "last_chat_id": "",
                        "sent_count": 0, "failed_count": 0, "last_sent_at": "", "last_failed_at": "",
@@ -41,6 +48,7 @@ class RuntimeStatus:
         # evidence that the current connection has received a message.
         self._state = {
             "schema_version": 1, "updated_at": utc_now(),
+            "bridge_build": runtime_identity(build),
             "qq": {"state": "starting", "connected": False, "identity_verified": False, "accounts": []},
             "feishu": self._feishu(),
             "snowluma": self._unknown_snowluma(),
@@ -51,14 +59,22 @@ class RuntimeStatus:
     @staticmethod
     def _unknown_snowluma() -> dict:
         return {"state": "unknown", "installed": None, "running": None, "auth_ok": None, "consent_required": None,
-                "accounts": [], "webui_port": None, "webui_url": ""}
+                "accounts": [], "webui_port": None, "webui_url": "", "send_ready": False,
+                "send_state": "unavailable", "send_checked_at": 0, "must_change_password": None}
 
     def _feishu(self) -> dict:
         state = text(getattr(self.larkx, "_last_state", "") or "starting", 40)
         connected = state == "running" and getattr(self.larkx, "client", None) is not None
         user_id = text(getattr(self.larkx, "user_id", ""))
-        return {"state": state, "connected": connected, "identity_verified": connected and bool(user_id),
-                "user_id": user_id, "account_id": text(getattr(self.larkx, "account_id", "default"))}
+        result = {"state": state, "connected": connected, "identity_verified": connected and bool(user_id),
+                  "user_id": user_id, "account_id": text(getattr(self.larkx, "account_id", "default"))}
+        recovery_status = getattr(self.larkx, "recovery_status", None)
+        if callable(recovery_status):
+            try:
+                result["recovery"] = safe_larkx_recovery_status(recovery_status())
+            except Exception:
+                result["recovery"] = safe_larkx_recovery_status({"state": "unavailable"})
+        return result
 
     def _write(self) -> None:
         with self._lock:
@@ -119,6 +135,15 @@ class RuntimeStatus:
                                 last_message_id=text(message_id))
             self._write()
 
+    async def record_larkx_trace(self, action: str, *, state: str, source_ref: str = "",
+                                 target_ref: str = "", count: int = 0, content_type: str = "image") -> None:
+        # Trace writes are separate from message persistence and ACKs.
+        try:
+            await asyncio.to_thread(self.events.write, action, state=state, source_ref=source_ref,
+                                    target_ref=target_ref, count=count, content_type=content_type)
+        except Exception:
+            pass
+
     def start(self) -> None:
         if self._task and not self._task.done():
             return
@@ -134,8 +159,12 @@ class RuntimeStatus:
         self._task = None
         await self._close_snowluma_recovery()
         with self._lock:
+            self._state["bridge_build"]["running"] = False
             self._state["qq"].update(state="stopped", connected=False, identity_verified=False, accounts=[])
             self._state["feishu"].update(state="stopped", connected=False, identity_verified=False)
+            recovery = self._state["feishu"].get("recovery")
+            if recovery:
+                recovery["state"] = "offline"
             self._write()
 
     async def _run(self) -> None:
@@ -155,15 +184,23 @@ class RuntimeStatus:
             await asyncio.sleep(self.interval)
 
     async def refresh(self) -> dict:
-        qq, snow = await asyncio.gather(self._qq(), self._snowluma())
-        with self._lock:
-            current = {"qq": qq, "feishu": self._feishu(), "snowluma": snow}
-            for name, value in current.items():
-                if value.get("state") != self._state.get(name, {}).get("state") or value.get("running") != self._state.get(name, {}).get("running"):
-                    self.events.write("connection", name, state=value.get("state"))
-            self._state.update(current)
-            self._write()
-            return json.loads(json.dumps(self._state))
+        import time
+        async with self._refresh_lock:
+            # Status consumers and each media send used to repeat all account
+            # queries, producing thousands of redundant OneBot requests.
+            if time.monotonic() - self._refreshed_at < 2:
+                with self._lock:
+                    return json.loads(json.dumps(self._state))
+            qq, snow = await asyncio.gather(self._qq(), self._snowluma())
+            with self._lock:
+                current = {"qq": qq, "feishu": self._feishu(), "snowluma": snow}
+                for name, value in current.items():
+                    if value.get("state") != self._state.get(name, {}).get("state") or value.get("running") != self._state.get(name, {}).get("running"):
+                        self.events.write("connection", name, state=value.get("state"))
+                self._state.update(current)
+                self._refreshed_at = time.monotonic()
+                self._write()
+                return json.loads(json.dumps(self._state))
 
     async def _qq(self) -> dict:
         manager = getattr(self.context, "platform_manager", None)
@@ -266,6 +303,13 @@ class RuntimeStatus:
             port = raw.get("webui_port")
             port = port if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535 else None
             result.update(webui_port=port, webui_url=f"http://127.0.0.1:{port}/" if port else "")
+            gate = await snowluma_send_gate(manager)
+            result.update({key: gate[key] for key in ("send_ready", "send_state", "send_checked_at")})
+            result["must_change_password"] = gate["send_state"] == "password_change_required"
+            if gate["send_state"] in {"ready", "consent_required"}:
+                result["consent_required"] = gate["send_state"] == "consent_required"
+            if gate["send_state"] == "auth_required":
+                result["auth_ok"] = False
             result["accounts"] = [{"uin": text(item.get("uin")), "nickname": text(item.get("nickname"), 120)}
                                   for item in raw.get("accounts", []) if isinstance(item, dict) and item.get("uin")]
             return result

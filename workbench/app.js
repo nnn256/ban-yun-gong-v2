@@ -1,4 +1,4 @@
-const UI_VERSION = '20261118-mapping-17'
+const UI_VERSION = '20261122-send-gate-15'
 
 const state = {
   status: null,
@@ -14,6 +14,8 @@ const state = {
   mappingEditingIndices: [],
   mappingSelfEdited: false,
   bridgeEnabled: null,
+  retryingDelivery: false,
+  exportingBuildDiagnostics: false,
 }
 
 const contentTypeOptions = [
@@ -123,6 +125,10 @@ function setAdapterState(key, value) {
     unavailable: { label: '当前不可用', cls: 'bad' },
     not_configured: { label: '未配置', cls: 'warn' },
     waiting: { label: key === 'qq' ? '等待 OneBot 连接' : '等待飞书扫码', cls: 'warn' },
+    consent_required: { label: '发送受阻 · 待确认协议', cls: 'bad' },
+    password_change_required: { label: '发送受阻 · 需修改初始密码', cls: 'bad' },
+    auth_required: { label: '发送受阻 · 登录会话失效', cls: 'bad' },
+    send_unavailable: { label: '已连接 · 发送权限待确认', cls: 'warn' },
     stopped: { label: '未启动', cls: '' },
   }
   const descriptor = map[value] || { label: '待确认', cls: '' }
@@ -189,7 +195,19 @@ function renderQqRuntime(status) {
   }))
   const qqActivity = qq
   $('#qqForwardActivity').textContent = `QQ 群事件 ${qqActivity.received_count || 0} · 发送接口接受 ${qqActivity.sent_count || 0} · 失败 ${qqActivity.failed_count || 0}`
-  setAdapterState('qq', qq.state || status.platforms?.qq)
+  const blockedState = qq.connected === true && snow.send_ready !== true
+    ? (['consent_required', 'password_change_required', 'auth_required'].includes(snow.send_state) ? snow.send_state : 'send_unavailable')
+    : ''
+  setAdapterState('qq', blockedState || qq.state || status.platforms?.qq)
+  if ($('#qqSendReadiness')) $('#qqSendReadiness').textContent = snow.send_ready === true
+    ? 'QQ 发送权限已核对。发送是否成功以接口回执为准。'
+    : snow.send_state === 'consent_required'
+      ? 'SnowLuma 用户协议尚未确认，消息保留在本地等待处理。请打开扩展确认协议，或在扩展中开启自动确认。'
+      : snow.send_state === 'password_change_required'
+        ? 'SnowLuma 要求修改初始密码，完成后自动恢复待处理消息。'
+        : snow.send_state === 'auth_required'
+          ? 'SnowLuma 登录会话需要刷新，消息保留在本地等待处理。'
+          : '正在核对 QQ 发送权限。'
   const snowUrl = localHttpUrl(snow.url || snow.webui_url || status.snowluma?.url)
   const snowLink = $('#openSnowLumaLocal')
   snowLink.href = snowUrl || 'http://127.0.0.1:5100/'
@@ -198,6 +216,83 @@ function renderQqRuntime(status) {
   snowLink.title = snowUrl ? '在本机浏览器打开当前 SnowLuma WebUI' : '等待插件导出当前实际端口'
   $('#qqOneBotAddress').textContent = 'ws://127.0.0.1:6199/ws'
   $('#launchLocalQq').disabled = Boolean(state.launchingQq)
+}
+
+function buildVersion(value) {
+  return typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : ''
+}
+
+function buildFingerprint(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : ''
+}
+
+function renderBridgeBuild(build, running = false) {
+  const current = build?.state === 'current' && build.matches === true && build.installed_matches === true
+    && buildVersion(build.runtime?.version) && build.runtime.version === buildVersion(build.expected?.version)
+    && buildFingerprint(build.runtime?.modules_fingerprint)
+    && build.runtime.modules_fingerprint === buildFingerprint(build.expected?.modules_fingerprint)
+  let label = '桥接版本待核对'
+  let cls = 'tag-neutral'
+  let detail = running
+    ? '尚未取得桥接插件实际加载的版本，暂不能确认已加载新版本。'
+    : '启动 AstrBot 后核对桥接插件实际加载的版本。'
+  if (current) {
+    label = '桥接版本已核对'
+    cls = 'tag-good'
+    detail = `桥接插件实际加载 v${build.runtime.version}，版本与代码指纹均已核对。`
+  } else if (build?.state === 'mismatch') {
+    label = '桥接代码不一致'
+    cls = 'tag-warning'
+    const loaded = buildVersion(build.runtime?.version)
+    const expected = buildVersion(build.expected?.version)
+    const versions = loaded && expected ? `实际加载 v${loaded}，目标 v${expected}。` : ''
+    detail = `${versions}${build.installed_matches === false ? '请先安装桥接插件，再重启 AstrBot 后重新核对。' : '请重启 AstrBot 后重新核对实际加载的代码。'}`
+  } else if (build?.state === 'stale') {
+    label = '桥接版本状态已过期'
+    cls = 'tag-warning'
+    detail = '版本记录已过期，暂不能确认当前实际加载的版本。请检查 AstrBot 运行状态，刷新后再次核对。'
+  } else if (build?.state === 'current') {
+    cls = 'tag-warning'
+    detail = '桥接插件版本信息不完整，暂不能确认已加载新版本。可导出版本诊断。'
+  }
+  $('#bridgeBuildState').textContent = label
+  $('#bridgeBuildState').className = `mini-tag ${cls}`
+  $('#bridgeBuildDetail').textContent = detail
+}
+
+function anonymousBuildDiagnostics(payload) {
+  if (!payload || payload.schema_version !== 1 || !payload.workbench || !payload.plugin) {
+    throw new Error('版本诊断格式无法识别，请重新打开工作台后重试')
+  }
+  const workbench = payload.workbench
+  const plugin = payload.plugin
+  const runtime = plugin.runtime
+  // Export an explicit allowlist from this dedicated endpoint. Status, account,
+  // route, path, message and bootstrap fields cannot enter the downloaded JSON.
+  return {
+    schema_version: 1,
+    workbench: {
+      version: buildVersion(workbench.version),
+      matches: workbench.matches === true,
+      modules_fingerprint: buildFingerprint(workbench.modules_fingerprint),
+      expected_fingerprint: buildFingerprint(workbench.expected_fingerprint),
+    },
+    plugin: {
+      state: ['current', 'mismatch', 'unavailable', 'stale'].includes(plugin.state) ? plugin.state : 'unavailable',
+      matches: plugin.matches === true,
+      runtime: runtime && typeof runtime === 'object' ? {
+        version: buildVersion(runtime.version),
+        process_id: Number.isInteger(runtime.process_id) && runtime.process_id > 0 && runtime.process_id < 2 ** 32 ? runtime.process_id : null,
+        run_id: typeof runtime.run_id === 'string' && /^[0-9a-f]{32}$/.test(runtime.run_id) ? runtime.run_id : '',
+        modules_fingerprint: buildFingerprint(runtime.modules_fingerprint),
+      } : null,
+      expected: {
+        version: buildVersion(plugin.expected?.version),
+        modules_fingerprint: buildFingerprint(plugin.expected?.modules_fingerprint),
+      },
+      installed_matches: plugin.installed_matches === true,
+    },
+  }
 }
 
 function renderStatus(status) {
@@ -217,6 +312,7 @@ function renderStatus(status) {
   $('#runtimeDetail').textContent = running
     ? `本机管理页已启动。${managed ? '由搬运工V2工作台启动。' : '该实例由其他进程启动。'}`
     : app.installed ? 'AstrBot 已安装，平台消息配置完成后即可启动。' : '运行环境尚未就绪，请检查本机 AstrBot 安装目录。'
+  renderBridgeBuild(status.plugin?.build, running)
 
   $('#topStart').disabled = running
   $('#runtimeStart').disabled = running || !app.installed || !rootReady
@@ -250,6 +346,14 @@ function renderStatus(status) {
   $('#feishuMonitorActivity').textContent = larkx.bridge_state === 'running'
     ? `实时监听已连接 · 收到 ${receivedCount} 条${lastReceived ? ` · 最近 ${lastReceived}` : ''} · 发送接口接受 ${acceptedCount} 条 · 失败 ${failedCount} 条。agent backend=none。`
     : `本机飞书客户端${larkx.desktop?.running ? '已识别' : '未运行'}；LarkAgentX 监听状态：${larkx.bridge_message || larkx.bridge_state || '等待扫码'}。`
+  const queue = status.delivery_queue || {}
+  const count = key => Math.max(0, Number(queue[key]) || 0)
+  const uncertain = Math.max(0, Number(queue.receipts?.uncertain) || 0)
+  $('#deliveryQueueActivity').textContent = queue.available === false
+    ? '本地转发队列暂时无法读取，请导出诊断日志。'
+    : `飞书收件：待处理 ${count('pending')} · 处理中 ${count('processing')} · 重试用尽 ${count('failed')}。${uncertain ? `另有 ${uncertain} 项正在发送或回执不明；请核对目标会话，系统不会盲目重发。` : '确定失败会自动重试，重试用尽后保留在本机。'}`
+  $('#retryFailedDelivery').disabled = state.retryingDelivery || queue.available === false || !running || !feishuConnected || count('failed') === 0
+  renderHistoryRecovery(status.runtime?.feishu?.recovery)
   const snowlumaPlugin = status.snowluma_plugin || {}
   $('#openSnowLumaExtension').href = snowlumaPlugin.astrbot_url || 'http://127.0.0.1:6185/#/extension/plugins'
   $('#openSnowLumaExtensionWizard').href = snowlumaPlugin.astrbot_url || 'http://127.0.0.1:6185/#/extension/plugins'
@@ -259,7 +363,7 @@ function renderStatus(status) {
 
   const setupStates = [
     Boolean(app.running && status.plugin?.installed),
-    status.runtime?.qq?.identity_verified === true,
+    status.runtime?.qq?.identity_verified === true && status.runtime?.snowluma?.send_ready === true,
     feishuConnected && receivedCount > 0,
     (status.rules?.enabled ?? 0) > 0,
   ]
@@ -345,15 +449,80 @@ function renderLogs(logs) {
   }))
 }
 
+function renderHistoryRecovery(recovery) {
+  const node = $('#historyRecoveryActivity')
+  if (!node) return
+  const labels = {
+    idle: '等待检查', waiting: '等待补读', offline: '等待飞书重连',
+    checking: '正在检查', catching_up: '正在补读', baseline: '已建立补读起点',
+    current: '检查完成', ready: '检查完成', recovered: '补读消息已入队',
+    gap: '有缺口待核对', degraded: '有缺口待核对', error: '检查失败',
+    unavailable: '暂时无法读取', disabled: '未启用', no_routes: '暂无启用的飞书来源规则',
+  }
+  let message = '飞书补读：尚无状态。'
+  if (recovery?.state === 'stale') message = '飞书补读：状态已过期，等待桥接插件更新。'
+  else if (recovery && Object.hasOwn(labels, recovery.state)) {
+    const count = key => Math.max(0, Number(recovery[key]) || 0)
+    const stamp = Date.parse(recovery.checked_at)
+    const checked = Number.isFinite(stamp) ? ` · 最近检查 ${new Date(stamp).toLocaleString('zh-CN', { hour12: false })}` : ''
+    message = `飞书补读：${labels[recovery.state]} · 已建立起点 ${count('baselined')} 个${count('configured') ? ` / ${count('configured')} 个会话` : ''} · 补读入队 ${count('recovered')} 条 · 待核对 ${count('missing')} 个 · 检查失败 ${count('errors')} 个${checked}。`
+  }
+  if (node.textContent !== message) node.textContent = message
+}
+
+const LARKX_LOG_STAGES = {
+  larkx_ingress: { persisted: '已写入收件队列', duplicate: '收件队列已收录', persist_failed: '收件写入失败' },
+  larkx_qq_route: { matched: '已选中 QQ 规则', no_route: '没有匹配的 QQ 规则', filtered: '已按规则过滤', echo: '已跳过转发回声', disabled: '转发已关闭' },
+  larkx_qq_delivery: { confirmed: 'QQ 发送接口已接受', rejected: 'QQ 发送明确失败', uncertain: 'QQ 发送回执不明', reused_confirmed: '已有 QQ 回执', reused_uncertain: '已有不明回执，未重发', duplicate: '已有发送记录，未重发', filtered: '补读范围已变更，已跳过', prep_failed: '图片准备失败' },
+  larkx_history: { baseline: '飞书补读已建立起点', recovered: '飞书补读消息已入队', gap: '飞书补读发现缺口' },
+}
+
+function formatLarkxTrace(line) {
+  try {
+    const event = JSON.parse(line)
+    if (event?.component !== 'bridge' || !Object.hasOwn(LARKX_LOG_STAGES, event.action)) return line
+    const labels = LARKX_LOG_STAGES[event.action]
+    if (!Object.hasOwn(labels, event.state)) return line
+    const reference = typeof event.source_ref === 'string' && /^[a-f0-9]{16}$/.test(event.source_ref) ? ` · 编号 ${event.source_ref}` : ''
+    const target = typeof event.target_ref === 'string' && /^[a-f0-9]{16}$/.test(event.target_ref) ? ` · 目标 ${event.target_ref}` : ''
+    const history = event.action === 'larkx_history'
+    const count = Number.isInteger(event.count) && event.count > 0
+      ? ` · ${event.count} ${event.action === 'larkx_qq_route' ? '条规则' : history ? '项' : '张'}` : ''
+    return `${history ? '' : '飞书图片 · '}${labels[event.state]}${count}${reference}${target}`
+  } catch {
+    return line
+  }
+}
+
 function renderBackground(background) {
-  const text = background.running ? '守护进程运行中，关闭浏览器仍会监控。' : background.enabled ? '后台恢复已启用，守护进程尚未就绪。' : '后台恢复已关闭。'
+  const fresh = background.running === true && background.heartbeat_fresh === true
+  let text
+  if (!background.enabled) text = '后台自动恢复已关闭。'
+  else if (!background.running) text = '后台守护未运行，自动恢复和防睡眠尚未生效。'
+  else if (!fresh) text = '后台守护无响应，暂时无法确认自动恢复和防睡眠是否生效。'
+  else if (background.install_identity_verified === false) text = '后台守护需要升级重启，请重新运行新版“打开工作台.vbs”。'
+  else if (background.state === 'port_conflict') text = '后台守护发现端口被其他安装占用，请检查运行目录和端口。'
+  else if (background.state === 'paused') text = '后台守护已运行，安装或更新期间暂停自动恢复。'
+  else if (background.state === 'waiting') text = '后台守护已运行，正在等待工作台或 AstrBot 就绪。'
+  else if (background.state === 'recovering') text = '后台守护已运行，正在恢复工作台或 AstrBot。'
+  else if (background.state === 'starting') text = '后台守护已启动，正在检查服务状态。'
+  else text = '后台守护心跳正常，关闭浏览器仍会监控。'
   if ($('#backgroundSummary')) $('#backgroundSummary').textContent = text
   if (!state.backgroundEditing) {
     if ($('#backgroundEnabled')) $('#backgroundEnabled').checked = background.enabled === true
     if ($('#backgroundSleep')) $('#backgroundSleep').checked = background.keep_awake === true
     if ($('#backgroundAutostart')) $('#backgroundAutostart').checked = background.autostart === true
   }
-  if ($('#backgroundDetail')) $('#backgroundDetail').textContent = `${text} ${background.keep_awake_active ? '当前已请求系统保持唤醒，显示器仍可关闭。' : '系统唤醒状态以守护进程为准。'}`
+  let power
+  if (!background.keep_awake) power = '防空闲睡眠已关闭，电脑仍可能自动睡眠。'
+  else if (fresh && background.keep_awake_state === 'failed') {
+    const code = Number.isInteger(background.keep_awake_error_code) && background.keep_awake_error_code >= 0
+      ? `（系统代码 ${background.keep_awake_error_code}）` : ''
+    power = `防空闲睡眠请求失败${code}，请查看或导出后台守护日志。`
+  } else if (fresh && background.keep_awake_state === 'unsupported') power = '当前系统不支持 Windows 防空闲睡眠功能。'
+  else if (background.enabled && fresh && background.install_identity_verified !== false && background.keep_awake_active === true) power = '防空闲睡眠请求已生效，允许显示器关闭。'
+  else power = '防空闲睡眠尚未确认生效，请检查守护状态后重新保存后台设置。'
+  if ($('#backgroundDetail')) $('#backgroundDetail').textContent = `${text} ${power} 手动睡眠、休眠、合盖触发睡眠或退出 Windows 用户会中断转发。`
 }
 
 async function refreshLogs(older = false) {
@@ -388,7 +557,7 @@ async function refreshLogs(older = false) {
       const time = document.createElement('time')
       time.textContent = new Date(entry.time).toLocaleString()
       const text = document.createElement('span')
-      text.textContent = `[${entry.component} · ${entry.level}] ${entry.text}`
+      text.textContent = `[${entry.component} · ${entry.level}] ${formatLarkxTrace(entry.text)}`
       node.append(time, text)
       return node
     }))
@@ -484,6 +653,7 @@ async function refresh(loadRules = false) {
     }
   } catch (error) {
     setPill('status-bad', '工作台连接异常')
+    renderBridgeBuild(undefined, Boolean(state.status?.astrbot?.running))
     toast(error.message, true)
   }
 }
@@ -825,12 +995,66 @@ function bindEvents() {
   $('#logQuery').addEventListener('submit', event => { event.preventDefault(); refreshLogs() })
   for (const id of ['logComponent', 'logLevel', 'logFile']) $(`#${id}`).addEventListener('change', () => refreshLogs())
   $('#olderLogs').addEventListener('click', () => { $('#logLive').checked = false; refreshLogs(true) })
-  $('#exportLogs').addEventListener('click', () => {
-    const blob = new Blob([(state.logEntries || []).map(entry => `${entry.time} [${entry.component}] ${entry.text}`).join('\n')], { type: 'text/plain;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url; link.download = `mover-logs-${Date.now()}.txt`; link.click()
-    URL.revokeObjectURL(url)
+  $('#exportLogs').addEventListener('click', async () => {
+    const button = $('#exportLogs')
+    if (button.disabled) return
+    button.disabled = true
+    button.textContent = '正在导出…'
+    try {
+      const response = await fetch('/api/logs/export', { cache: 'no-store' })
+      if (!response.ok) throw new Error('诊断日志导出失败，请稍后重试')
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url; link.download = `mover-diagnostics-${Date.now()}.zip`; link.click()
+      setTimeout(() => URL.revokeObjectURL(url), 10000)
+      toast('已导出各组件保留日志，包含范围和截断情况见 ZIP 内 manifest.json')
+    } catch (error) {
+      toast(error.message, true)
+    } finally {
+      button.disabled = false
+      button.textContent = '导出诊断日志 ZIP'
+    }
+  })
+  $('#exportBuildDiagnostics').addEventListener('click', async () => {
+    const button = $('#exportBuildDiagnostics')
+    if (state.exportingBuildDiagnostics) return
+    state.exportingBuildDiagnostics = true
+    button.disabled = true
+    button.textContent = '正在导出…'
+    try {
+      const payload = anonymousBuildDiagnostics(await request('/api/diagnostics/build'))
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      try {
+        const link = document.createElement('a')
+        link.href = url
+        link.download = `mover-build-diagnostics-${Date.now()}.json`
+        link.click()
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 10000)
+      }
+      toast('已导出匿名版本诊断 JSON，仅含版本、进程标识和代码指纹')
+    } catch (error) {
+      toast(`版本诊断导出失败：${error.message}`, true)
+    } finally {
+      state.exportingBuildDiagnostics = false
+      button.disabled = false
+      button.textContent = '导出版本诊断 JSON'
+    }
+  })
+  $('#retryFailedDelivery').addEventListener('click', async () => {
+    const button = $('#retryFailedDelivery')
+    if (state.retryingDelivery || button.disabled) return
+    state.retryingDelivery = true
+    button.disabled = true
+    button.textContent = '正在重新排队…'
+    try {
+      await postAction('/api/bridge/retry-failed', {}, '失败消息已重新排队')
+    } finally {
+      state.retryingDelivery = false
+      button.textContent = '重试失败消息'
+      if (state.status) renderStatus(state.status)
+    }
   })
   $('#backgroundForm').addEventListener('change', () => { state.backgroundEditing = true })
   $('#backgroundForm').addEventListener('submit', async event => {

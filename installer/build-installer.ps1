@@ -34,7 +34,7 @@ New-Item -ItemType Directory -Force -Path $payloadRoot,$artifactRoot,$cacheRoot 
 $rootFiles = @(
     'README.md', 'VERIFICATION.txt', 'PROTOCOL_REVIEW.md', 'launch-workbench.cmd', '一键启动.cmd',
     '后台运行.vbs', '打开工作台.vbs',
-    'updater.py', 'update-and-start.ps1', '更新并启动.cmd', 'log_store.py',
+    'updater.py', 'update-and-start.ps1', 'python-runtime.ps1', '更新并启动.cmd', 'log_store.py',
     'install.ps1', 'install_astrbot.ps1', 'install_larkagentx.ps1',
     'install_snowluma.ps1', 'start_snowluma.ps1', 'start-workbench.ps1',
     'stop-workbench.ps1', 'background_runtime.py', 'background_supervisor.py', 'astrbot_runner.py',

@@ -25,7 +25,7 @@ class InstallerLaunchContractTests(unittest.TestCase):
         self.assertEqual(shortcuts["DesktopWorkbenchShortcut"]["Arguments"], "--open --start-here")
         self.assertIn('LaunchArguments="--open --start-here"', bundle)
         self.assertIn("Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $payloadRoot 'mover-v2-launcher.exe')", build)
-        for required in ("updater.py", "update-and-start.ps1", "log_store.py"):
+        for required in ("updater.py", "update-and-start.ps1", "python-runtime.ps1", "log_store.py"):
             self.assertIn("'" + required + "'", build)
         self.assertEqual(package_node.attrib["Version"], "$(var.ReleaseVersion)")
         self.assertEqual(bundle_node.attrib["Version"], "$(var.ReleaseVersion).0")

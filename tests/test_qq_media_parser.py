@@ -1,6 +1,7 @@
 """Exercise the installed AstrBot parser outside the plugin's test stubs."""
 import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,10 +15,14 @@ class InstalledQQMediaParserTests(unittest.TestCase):
         script = r'''
 import asyncio
 import base64
+import faulthandler
+import sys
 import tempfile
 import wave
 from pathlib import Path
 
+faulthandler.dump_traceback_later(80, exit=True)
+sys.path.insert(0, sys.argv[1])
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import File, Record, Video
 from astrbot_plugin_message_bridge.qq_transport import _onebot_segments
@@ -57,11 +62,16 @@ async def main():
         print("native record/video/file parser smoke passed")
 
 asyncio.run(main())
+faulthandler.cancel_dump_traceback_later()
 '''
-        result = subprocess.run(
-            [str(python), "-B", "-c", script], cwd=project,
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
-        )
+        # AstrBot's API imports also initialize a data directory and load the
+        # provider SDKs; cold imports can exceed 30 seconds on Windows.
+        with tempfile.TemporaryDirectory(prefix="mover-astrbot-parser-") as directory:
+            result = subprocess.run(
+                [str(python.resolve()), "-I", "-B", "-u", "-c", script, str(project)], cwd=directory,
+                env={**os.environ, "ASTRBOT_ROOT": directory},
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+            )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("native record/video/file parser smoke passed", result.stdout)
 

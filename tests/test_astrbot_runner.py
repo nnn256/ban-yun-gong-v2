@@ -141,6 +141,9 @@ class AstrBotRunnerTests(unittest.TestCase):
         self.assertTrue(astrbot_runner.is_astrbot_command([str(exe), "run", "-p", "6185"], exe, exe))
         python = root / "python.exe"
         self.assertTrue(astrbot_runner.is_astrbot_command([str(python), "-m", "astrbot", "run", "-p", "6185"], python, exe))
+        self.assertTrue(astrbot_runner.is_astrbot_command([str(python), "-B", "-m", "astrbot.cli", "run", "-p", "6185"], python, exe))
+        other = root / "other/python.exe"
+        self.assertFalse(astrbot_runner.is_astrbot_command([str(other), "-m", "astrbot.cli", "run"], other, exe))
         self.assertTrue(astrbot_runner.is_astrbot_command([str(python), str(exe), "run", "-p", "6185"], python, exe))
         self.assertFalse(astrbot_runner.is_astrbot_command([str(python), str(root / "other" / "astrbot.exe"), "run"], python, exe))
         self.assertFalse(astrbot_runner.is_astrbot_command([str(python), "other.py", "run"], python, exe))

@@ -30,6 +30,7 @@ class WorkbenchConfigTests(unittest.TestCase):
             (root / "data" / "cmd_config.json").write_text('{"dashboard":{"password":"fixture"}}', encoding="utf-8")
             executable = root / "astrbot.exe"
             executable.touch()
+            executable.with_name("python.exe").touch()
             launch = SimpleNamespace(pid=202, poll=lambda: None)
             with (
                 patch.object(server, "ASTRBOT_EXE", executable),
@@ -47,6 +48,9 @@ class WorkbenchConfigTests(unittest.TestCase):
                 owner.return_value = 303
                 self.assertEqual(server.start_astrbot()["pid"], 303)
                 spawn.assert_called_once()
+                command = spawn.call_args.args[0]
+                child = command[command.index("--") + 1:]
+                self.assertEqual(child, [str(executable.with_name("python.exe")), "-B", "-m", "astrbot.cli", "run", "-p", "7185"])
 
     def test_load_settings_atomically_repairs_deleted_extraction_root_to_initialized_local_runtime(self):
         with tempfile.TemporaryDirectory() as temp:

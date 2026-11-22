@@ -41,7 +41,7 @@ class PortableLauncherRuntimeTests(unittest.TestCase):
         (self.root / "tools" / "uv.exe").write_bytes(b"fixture")
         (self.root / "astrbot_plugin_message_bridge").mkdir()
         (self.root / "astrbot_plugin_message_bridge" / "metadata.yaml").write_text("name: astrbot_plugin_message_bridge\n", encoding="utf-8")
-        for name in ("updater.py", "workbench_server.py"):
+        for name in ("updater.py", "workbench_server.py", "python-runtime.ps1"):
             (self.root / name).write_text("# local dependency fixture\n", encoding="utf-8")
         (self.root / "start-workbench.ps1").write_text("exit 0", encoding="utf-8-sig")
         self.compiler = self.root / "mover-v2-launcher.exe"
@@ -142,7 +142,7 @@ $window=[ConsoleProbe]::GetConsoleWindow()
     def test_check_rejects_missing_update_dependencies_without_creating_logs(self):
         self.make_stub("exit 0")
         for name in ("update-and-start.ps1", "updater.py", "start-workbench.ps1",
-                     "workbench_server.py", "astrbot_plugin_message_bridge/metadata.yaml"):
+                     "python-runtime.ps1", "workbench_server.py", "astrbot_plugin_message_bridge/metadata.yaml"):
             with self.subTest(dependency=name):
                 path = self.root / name
                 previous = path.read_bytes()
@@ -202,6 +202,7 @@ $window=[ConsoleProbe]::GetConsoleWindow()
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(self.root / name, target)
         (other / "tools" / "uv.exe").write_bytes(b"fixture")
+        (other / "python-runtime.ps1").write_text("# fixture\n", encoding="utf-8-sig")
         first = subprocess.Popen([str(self.compiler)], cwd=self.root)
         second = subprocess.Popen([str(other / "mover-v2-launcher.exe")], cwd=other)
         self.assertEqual(first.wait(timeout=30), 0)

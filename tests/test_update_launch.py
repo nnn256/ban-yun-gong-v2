@@ -79,20 +79,11 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
     def setUp(self):
         import winreg
         self.winreg = winreg
-        self.key_name = r"Software\InformationMoverV2"
-        self.previous = None
-        self.key_existed = False
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.key_name) as key:
-                self.key_existed = True
-                try:
-                    self.previous = winreg.QueryValueEx(key, "InstallRoot")
-                except FileNotFoundError:
-                    pass
-        except FileNotFoundError:
-            pass
         self.temp = tempfile.TemporaryDirectory(prefix="mover-update-launch-")
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.key_name = rf"Software\InformationMoverV2-Fixture-{self.root.name}"
+        self.addCleanup(self.clear_registration)
         self.source = self.root / "new release 新版"
         self.target = self.root / "existing 已登录"
         for folder in (self.source, self.target):
@@ -101,8 +92,16 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
             (folder / "workbench_server.py").write_text("VERSION='old'\n", encoding="utf-8")
             (folder / "start-workbench.ps1").write_text(START_STUB, encoding="utf-8-sig")
         (self.target / "stop-workbench.ps1").write_text(LEGACY_STOP, encoding="utf-8-sig")
-        for name in ("updater.py", "update-and-start.ps1", "background_runtime.py", "background_supervisor.py", "stop-workbench.ps1"):
+        for name in ("updater.py", "update-and-start.ps1", "python-runtime.ps1", "background_runtime.py", "background_supervisor.py", "stop-workbench.ps1"):
             shutil.copy2(ROOT / name, self.source / name)
+        script = self.source / "update-and-start.ps1"
+        registration = r"$registration = 'HKCU:\Software\InformationMoverV2'"
+        source = script.read_text(encoding="utf-8-sig")
+        self.assertIn(registration, source)
+        script.write_text(source.replace(registration, rf"$registration = 'HKCU:\{self.key_name}'", 1), encoding="utf-8-sig")
+        # Update ordering tests use a local interpreter even when py.exe is an
+        # App Installer alias. The runtime suite exercises missing/broken Python.
+        venv.EnvBuilder(with_pip=False).create(self.source / "runtime/.venv")
         (self.source / "workbench_server.py").write_text("VERSION='new'\n", encoding="utf-8")
         self.protected = {}
         for name in ("runtime/LarkAgentX-data/credentials.json", "runtime/AstrBot/data/plugin_data/astrbot_plugin_message_bridge/bridge_rules.json", "runtime/AstrBot/data/plugin_data/pulids_snowluma_go_to_astrbot/snowluma/account/session.db", "workbench.settings.json"):
@@ -115,29 +114,16 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
             listener.bind(("127.0.0.1", 0))
             self.environment["MOVER_WORKBENCH_PORT"] = str(listener.getsockname()[1])
         self.environment["PYTHONUTF8"] = "1"
+        self.environment["UV_OFFLINE"] = "1"
         self.port = int(self.environment["MOVER_WORKBENCH_PORT"])
         self.run_number = 0
         self.seal()
 
-    def tearDown(self):
-        winreg = self.winreg
+    def clear_registration(self):
         try:
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.key_name) as key:
-                if self.previous:
-                    value, kind = self.previous
-                    winreg.SetValueEx(key, "InstallRoot", 0, kind, value)
-                else:
-                    try:
-                        winreg.DeleteValue(key, "InstallRoot")
-                    except FileNotFoundError:
-                        pass
-            if not self.key_existed:
-                try:
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, self.key_name)
-                except OSError:
-                    pass
-        finally:
-            self.temp.cleanup()
+            self.winreg.DeleteKey(self.winreg.HKEY_CURRENT_USER, self.key_name)
+        except FileNotFoundError:
+            pass
 
     def seal(self):
         manifest = updater.build_manifest(self.source, "2.0.9")
@@ -267,10 +253,10 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
 
     def test_zip_update_nostart_applies_and_preserves_all_login_bytes(self):
         package = self.root / "release.zip"
+        manifest = json.loads((self.source / updater.MANIFEST_NAME).read_text(encoding="utf-8"))
         with zipfile.ZipFile(package, "w") as archive:
-            for path in self.source.rglob("*"):
-                if path.is_file():
-                    archive.write(path, path.relative_to(self.source).as_posix())
+            for name in (updater.MANIFEST_NAME, *manifest["files"]):
+                archive.write(self.source / name, name)
         process = self.run_update("-TargetRoot", str(self.target), "-PackagePath", str(package), "-NoStart")
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertFalse((self.target / "runtime/fixture-started.json").exists())
@@ -363,6 +349,10 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
     def test_failed_apply_resumes_previous_start_and_watchdog(self):
         (self.source / "log_store.py").write_text("# an update file\n", encoding="utf-8")
         (self.target / "log_store.py").mkdir()
+        broken_python = self.target / "runtime/.venv/Scripts/python.exe"
+        broken_python.parent.mkdir(parents=True)
+        broken_python.write_bytes(b"existing, unusable interpreter")
+        self.protected[broken_python] = hashlib.sha256(broken_python.read_bytes()).hexdigest()
         self.seal()
         with self.running_workbench(self.target), self.running_supervisor() as (watchdog, old_pid):
             process = self.run_update("-TargetRoot", str(self.target), "-NoBrowser", "-SkipDesktopActions")
@@ -391,7 +381,6 @@ class WindowsUpdateLaunchTests(unittest.TestCase):
         background_runtime.set_desired(self.source, enabled=False, astrbot_desired=False, keep_awake=False, port=self.port)
         config = self.source / "runtime/background.settings.json"
         expected = config.read_bytes()
-        venv.EnvBuilder(with_pip=False).create(self.source / "runtime/.venv")
         (self.source / "tools").mkdir()
         (self.source / "tools/uv.exe").write_bytes(b"only the venv is used in this fixture")
         launcher = self.source / "mover-v2-launcher.exe"

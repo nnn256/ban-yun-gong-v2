@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import hashlib
+import importlib.util
 import os
 import re
 import secrets
@@ -34,7 +35,7 @@ from astrbot_plugin_message_bridge.event_log import safe_larkx_recovery_status
 from astrbot_plugin_message_bridge import build_identity
 
 
-WORKBENCH_VERSION = "2.0.15"
+WORKBENCH_VERSION = "2.0.16"
 _WORKBENCH_FILES = ("workbench_server.py", "background_runtime.py", "log_store.py")
 _WORKBENCH_LOADED_MODULES = {name: str(getattr(sys.modules.get(name[:-3]), "MODULE_BUILD", ""))
                             for name in _WORKBENCH_FILES}
@@ -862,8 +863,9 @@ def _start_astrbot(reset_password: bool) -> dict[str, Any]:
     global _astrbot_process, _initial_password
     settings = load_settings()
     root = astrbot_root(settings)
-    if not ASTRBOT_EXE.is_file():
-        raise ValueError("AstrBot 运行环境未安装；检查 runtime/.venv/Scripts/astrbot.exe")
+    astrbot_python = ASTRBOT_EXE.with_name("python.exe")
+    if not astrbot_python.is_file():
+        raise ValueError("AstrBot 运行环境未安装；请从桌面快捷方式重新启动以修复 Python 环境")
     if not (root / ".astrbot").is_file():
         raise ValueError("AstrBot 尚未初始化")
     pending = {"started": True, "already_starting": True, "port": settings["astrbot_port"]}
@@ -891,7 +893,9 @@ def _start_astrbot(reset_password: bool) -> dict[str, Any]:
         dashboard.get("pbkdf2_password") or dashboard.get("password")
     )
 
-    command = [str(ASTRBOT_EXE), "run", "-p", str(settings["astrbot_port"])]
+    # Console-script EXEs embed absolute interpreter paths and can survive a
+    # moved/repaired venv with the old path. Use the verified sibling directly.
+    command = [str(astrbot_python), "-B", "-m", "astrbot.cli", "run", "-p", str(settings["astrbot_port"])]
     if reset_password:
         command.append("--reset-password")
     environment = os.environ.copy()
@@ -1628,7 +1632,8 @@ def get_status() -> dict[str, Any]:
         "version": WORKBENCH_VERSION,
         "background": background_runtime.status(ROOT),
         "astrbot": {
-            "installed": ASTRBOT_EXE.is_file(),
+            "installed": (ASTRBOT_EXE.with_name("python.exe").is_file()
+                          and importlib.util.find_spec("astrbot") is not None),
             "root_ready": root_ready,
             "running": running,
             "starting": not running and process is not None and process.poll() is None,

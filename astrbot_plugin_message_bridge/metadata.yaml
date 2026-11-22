@@ -1,7 +1,7 @@
 name: astrbot_plugin_message_bridge
 display_name: 搬运工V2
 desc: 在 AstrBot 的 QQ/OneBot 与 LarkAgentX 飞书个人账号之间双向转发；LarkAgentX agent backend=none。
-version: v2.0.15
+version: v2.0.16
 author: local
 support_platforms:
   - aiocqhttp

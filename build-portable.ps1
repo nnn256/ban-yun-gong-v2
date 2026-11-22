@@ -93,7 +93,7 @@ try {
     New-Item -ItemType Directory -Force -Path $checkTools | Out-Null
     Copy-Item -LiteralPath $OutputExe -Destination (Join-Path $checkRoot '搬运工V2.exe')
     $checkFiles = @(
-        'update-and-start.ps1', 'updater.py', 'start-workbench.ps1',
+        'update-and-start.ps1', 'updater.py', 'start-workbench.ps1', 'python-runtime.ps1',
         'workbench_server.py', 'astrbot_plugin_message_bridge\metadata.yaml'
     )
     foreach ($relativePath in $checkFiles) {

@@ -250,7 +250,8 @@ def status(root: Path) -> dict[str, Any]:
     return result
 
 
-def ensure_supervisor(root: Path, port: int | None = None, *, timeout: float = 8.0) -> dict[str, Any]:
+def ensure_supervisor(root: Path, port: int | None = None, *, timeout: float = 8.0,
+                      use_current_python: bool = False) -> dict[str, Any]:
     """Confirm a live, installation-owned heartbeat, not merely a spawned PID.
 
     A missing power request is reported in the returned status; it does not
@@ -277,7 +278,7 @@ def ensure_supervisor(root: Path, port: int | None = None, *, timeout: float = 8
     exited_at = None
     if not current["running"]:
         python = Path(root) / "runtime/.venv/Scripts/python.exe"
-        if not python.is_file():
+        if use_current_python or not python.is_file():
             python = Path(sys.executable)
         kwargs: dict[str, Any] = {"cwd": str(root), "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if os.name == "nt":
@@ -357,7 +358,10 @@ def main() -> None:
     parser.add_argument("root", type=Path)
     parser.add_argument("--port", type=int)
     parser.add_argument("--run-id")
+    parser.add_argument("--use-current-python", action="store_true", help="Restore the supervisor with a verified interpreter after a failed update.")
     args = parser.parse_args()
+    if args.use_current_python and args.action != "ensure":
+        parser.error("--use-current-python requires ensure")
     if args.action == "stop-for-update":
         if paused(args.root) != "update":
             parser.exit(2, "An active update marker is required.\n")
@@ -374,7 +378,7 @@ def main() -> None:
     else:
         ensure_settings(args.root)
         try:
-            result = ensure_supervisor(args.root, args.port)
+            result = ensure_supervisor(args.root, args.port, use_current_python=args.use_current_python)
         except OSError as exc:
             parser.exit(1, str(exc) + "\n")
         if result["enabled"] and not (result["running"] and result["heartbeat_fresh"] and

@@ -13,7 +13,7 @@ import uuid
 from typing import Any
 
 
-BRIDGE_VERSION = "2.0.15"
+BRIDGE_VERSION = "2.0.16"
 CODE_FILES = (
     "build_identity.py", "bridge_core.py", "event_log.py", "larkx_bridge.py",
     "larkx_history.py", "larkx_inbox.py", "larkx_media.py", "larkx_merge.py", "larkx_receive.py",

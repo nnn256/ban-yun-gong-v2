@@ -63,6 +63,8 @@ def is_astrbot_command(command: list[str], executable: str | Path, expected_exe:
         return True
     lowered = [part.lower().replace("/", "\\") for part in command]
     for index, part in enumerate(lowered[:-1]):
+        if part == "-m" and lowered[index + 1] == "astrbot.cli":
+            return Path(command[0]).resolve() == Path(expected_exe).with_name("python.exe").resolve()
         if part == "-m" and lowered[index + 1] in {"astrbot", "astrbot.__main__"}:
             return True
     return any("\\site-packages\\astrbot\\__main__.py" in part for part in lowered)

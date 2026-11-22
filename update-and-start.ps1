@@ -109,25 +109,15 @@ if ($StartHere) {
     $null = Get-OwnedWorkbench
 }
 
-$python = @(
-    (Join-Path $TargetRoot 'runtime\.venv\Scripts\python.exe'),
-    (Join-Path $sourceRoot 'runtime\.venv\Scripts\python.exe')
-) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-$pythonArgs = @()
-if (-not $python) {
-    $launcher = Get-Command py -ErrorAction SilentlyContinue
-    if ($launcher) { $python = $launcher.Source; $pythonArgs = @('-3') }
-    else {
-        $python = Join-Path $sourceRoot 'tools\uv.exe'
-        if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Bundled tools\uv.exe is missing. Fully extract the release ZIP first.' }
-        $pythonArgs = @('run','--no-project','--python','3.12','python')
-    }
-}
+. (Join-Path $sourceRoot 'python-runtime.ps1')
+$verificationPython = Get-MoverVerificationPython -SourceRoot $sourceRoot -TargetRoot $TargetRoot
+$python = $verificationPython.Executable
+$pythonArgs = @($verificationPython.Arguments)
 $updater = Join-Path $sourceRoot 'updater.py'
 $sameDirectory = $source -eq $TargetRoot
 $verified = $null
 if (-not ($sameDirectory -and -not (Test-Path -LiteralPath (Join-Path $sourceRoot 'release-manifest.json')))) {
-    $verifyOutput = & $python @pythonArgs -B $updater verify $source
+    $verifyOutput = & $python @pythonArgs -I -B $updater verify $source
     if ($LASTEXITCODE -ne 0) { throw 'Package verification failed; the existing installation has not been changed.' }
     $verified = ($verifyOutput | Select-Object -Last 1) | ConvertFrom-Json
     Write-Output ('Verified local release ' + $verified.version)
@@ -181,7 +171,8 @@ function Restore-StoppedSupervisor {
     # Only restore the target watchdog actually stopped by this update. The helper
     # re-reads saved preferences, including a manual opt-out made during startup.
     try {
-        & $python @pythonArgs -B (Join-Path $sourceRoot 'background_runtime.py') ensure $TargetRoot
+        # The target interpreter may still be broken after rollback; reuse the one verified above.
+        & $python @pythonArgs -I -B (Join-Path $sourceRoot 'background_runtime.py') ensure $TargetRoot --use-current-python
         if ($LASTEXITCODE -ne 0) { throw 'Background recovery did not start.' }
     } catch { Write-Warning ('Could not resume background recovery: ' + $_.Exception.Message) }
 }
@@ -198,7 +189,7 @@ try {
     # Separate source releases and ZIPs are applied transactionally after owned services stop.
     if (-not $sameDirectory) {
         Stop-ForUpdate (Get-OwnedWorkbench)
-        $applyOutput = & $python @pythonArgs -B $updater apply $source $TargetRoot
+        $applyOutput = & $python @pythonArgs -I -B $updater apply $source $TargetRoot
         if ($LASTEXITCODE -ne 0) { throw 'Update failed. Original program files were rolled back; login information was preserved.' }
         $result = ($applyOutput | Select-Object -Last 1) | ConvertFrom-Json
         Write-Output ('Updated ' + $result.changed_files + ' application files in ' + $TargetRoot)

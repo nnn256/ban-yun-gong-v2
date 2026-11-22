@@ -139,7 +139,7 @@ internal static class PortableLauncher
         // --check only inspects local files. It must never bootstrap services,
         // mutate user data, register startup or attempt a download.
         string[] required = {
-            "update-and-start.ps1", "updater.py", "start-workbench.ps1",
+            "update-and-start.ps1", "updater.py", "start-workbench.ps1", "python-runtime.ps1",
             "workbench_server.py", Path.Combine("astrbot_plugin_message_bridge", "metadata.yaml"),
             Path.Combine("tools", "uv.exe")
         };

@@ -24,7 +24,7 @@ ROOT_FILES = {
     "start_snowluma.ps1", "start-workbench.ps1", "stop-workbench.ps1", "verify.ps1",
     "package.ps1", "workbench_server.py", "workbench.settings.example.json",
     "搬运工V2.exe", "mover-v2-launcher.exe", "updater.py", "update-and-start.ps1",
-    "background_runtime.py", "background_supervisor.py", "background-watchdog.ps1", "runtime_logs.py", "workbench_logs.py", "log_store.py", "astrbot_runner.py",
+    "background_runtime.py", "background_supervisor.py", "background-watchdog.ps1", "runtime_logs.py", "workbench_logs.py", "log_store.py", "astrbot_runner.py", "python-runtime.ps1",
 }
 DIRECTORIES = {
     "astrbot_plugin_message_bridge": {".py", ".yaml", ".json"},

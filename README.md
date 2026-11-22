@@ -4,17 +4,30 @@
 
 ## 下载与安装
 
-- [下载 2.0.15 中文安装包（Windows 10/11 x64）](https://github.com/nnn256/ban-yun-gong-v2/releases/download/v2.0.15/MoverV2-Setup-2.0.15-x64.exe)
-- [下载 2.0.15 便携 ZIP](https://github.com/nnn256/ban-yun-gong-v2/releases/download/v2.0.15/MoverV2-2.0.15.zip)
-- [发行说明与 SHA-256 校验文件](https://github.com/nnn256/ban-yun-gong-v2/releases/tag/v2.0.15)
+- [下载 2.0.16 中文安装包（Windows 10/11 x64）](https://github.com/nnn256/ban-yun-gong-v2/releases/download/v2.0.16/MoverV2-Setup-2.0.16-x64.exe)
+- [下载 2.0.16 便携 ZIP](https://github.com/nnn256/ban-yun-gong-v2/releases/download/v2.0.16/MoverV2-2.0.16.zip)
+- [发行说明与 SHA-256 校验文件](https://github.com/nnn256/ban-yun-gong-v2/releases/tag/v2.0.16)
 
 1. 双击安装包，按中文向导完成安装。默认目录是 `%LOCALAPPDATA%\Programs\搬运工V2`。覆盖升级时，在“选项”选择原安装目录，以便沿用本机登录、群映射和设置。
 2. 点“启动工作台”，以后可双击桌面“搬运工V2工作台”，也可从开始菜单打开。首次启动需要联网准备 Python、AstrBot 和平台连接组件，无需手动安装开发环境。新安装会在默认工作台端口 `18766` 被占用时从 `18767`–`18786` 选择空闲端口，浏览器会打开实际地址。
-3. 在“接入向导”扫码，并按提示完成 QQ 协议确认。到“群映射”自行选择来源和目标。全新安装从空规则开始。运行总览应显示桥接插件 `v2.0.15` 和“桥接版本已核对”。
+3. 在“接入向导”扫码，并按提示完成 QQ 协议确认。到“群映射”自行选择来源和目标。全新安装从空规则开始。运行总览应显示桥接插件 `v2.0.16` 和“桥接版本已核对”。
 
 便携版请完整解压 ZIP，双击 `打开工作台.vbs`。若只需在后台运行，可双击 `搬运工V2.exe`。安装包和 ZIP 均不携带 QQ 或飞书会话、真实规则、群映射、运行日志和聊天数据。
 
 卸载前可在“本地设置 → 后台保活”关闭 Windows 登录后自动运行，再运行安装目录中的 `stop-workbench.ps1` 停止当前实例。在 Windows **设置 → 应用 → 已安装的应用** 找到 **搬运工V2 安装程序**，选择**卸载**。程序文件及快捷方式由 Windows 安装器移除，本机配置和 `runtime` 数据可留给下次安装使用。
+
+## 2.0.16 Python 启动环境修复
+
+修复 `uv trampoline failed to spawn Python child process / entity not found (os error 2)` 导致“Package verification failed”并停止启动的问题。旧版只判断 `python.exe` 文件存在，无法识别其内部指向的 Python 已被移动、清理或失效。
+
+- 更新校验前实际执行 Python 探测；本机环境失效时，改用可运行的解释器完成原有的包校验，保留逐文件 SHA-256 检查。
+- 没有可运行的系统 Python 时，使用随包的 uv 在本安装的 `runtime\python` 准备固定的 Python 3.12.13，无需手动安装开发环境，也不注册为系统默认 Python。
+- 应用环境失效时，修复 `runtime\.venv` 的解释器入口，保留已安装包，再核验 AstrBot 依赖。登录、群映射、转发规则、队列和数据库不是修复目标。
+- AstrBot 初始化和启动通过当前环境的 `python -m astrbot.cli` 执行，避免旧 `astrbot.exe` 内的绝对路径导致第二次启动失败。
+
+**遇到上述报错的用户：** 下载 2.0.16 安装包，在安装选项选择报错中的原目录（例如 `%LOCALAPPDATA%\Programs\搬运工V2`），覆盖升级后点“启动工作台”。保持联网，等待 Python 准备和依赖检查完成。无需先卸载或删除 `runtime`。若已缓存的 Python 仍能运行，可离线完成环境检测；缺少运行时或依赖时仍需联网。
+
+本轮回归包含真实 uv Windows 启动器失效、无系统 Python、离线失败保护、修复后幂等、中文空格路径和更新校验。完整安装、升级、卸载及报错电脑的真实收发仍需分别验收。
 
 ## 2.0.15 发送权限与回执修复
 
@@ -237,7 +250,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 使用 PowerShell 7 和 WiX 7.0.1 构建中文 x64 安装程序与便携 ZIP：
 
 ~~~powershell
-.\installer\build-installer.ps1 -PortablePath '.\artifacts\搬运工V2-2.0.15.zip'
+.\installer\build-installer.ps1 -PortablePath '.\artifacts\搬运工V2-2.0.16.zip'
 ~~~
 
 构建脚本先执行回归，再从明确的文件清单生成安装载荷。成品位于 `artifacts`。环境准备和构建细节见 [安装器构建说明](installer/README.md)。

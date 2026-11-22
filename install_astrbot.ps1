@@ -8,43 +8,30 @@ $toolsDir = Join-Path $PSScriptRoot 'tools'
 if (Test-Path -LiteralPath (Join-Path $toolsDir 'uv.exe') -PathType Leaf) {
     $env:PATH = "$toolsDir;$env:PATH"
 }
-$venvPython = Join-Path $runtimeDir '.venv\Scripts\python.exe'
-$astrbotCommand = Join-Path $runtimeDir '.venv\Scripts\astrbot.exe'
+. (Join-Path $projectRoot 'python-runtime.ps1')
+$venvPython = Initialize-MoverApplicationPython $projectRoot
 
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    throw 'AstrBot 需要 uv。请先安装 uv，再重新运行此脚本。'
-}
-
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    uv venv --python 3.12 (Join-Path $runtimeDir '.venv')
+$probeArgs = @('-I','-B','-c','from astrbot.cli.__main__ import cli; import psutil, aiohttp, cryptography, win32crypt')
+$dependencies = Invoke-MoverRuntimeCommand -Executable $venvPython -Arguments $probeArgs -TimeoutMilliseconds 30000
+if ($dependencies.ExitCode -ne 0) {
+    $uv = Get-MoverUv $projectRoot
+    & $uv pip install --python $venvPython 'astrbot==4.29.4' --reinstall-package astrbot --reinstall-package pywin32
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
-
-$environmentReady = $false
-if ((Test-Path -LiteralPath $venvPython -PathType Leaf) -and (Test-Path -LiteralPath $astrbotCommand -PathType Leaf)) {
-    $previousErrorPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & $venvPython -c "import astrbot, psutil, aiohttp, cryptography, win32crypt"
-        $environmentReady = $LASTEXITCODE -eq 0
-    }
-    finally { $ErrorActionPreference = $previousErrorPreference }
-}
-if (-not $environmentReady) {
-    uv pip install --python $venvPython 'astrbot==4.29.4'
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $dependencies = Invoke-MoverRuntimeCommand -Executable $venvPython -Arguments $probeArgs -TimeoutMilliseconds 30000
+    if ($dependencies.ExitCode -ne 0) { throw 'AstrBot dependencies still cannot load. Saved logins and rules were retained.' }
 }
 
 New-Item -ItemType Directory -Force -Path $astrbotRoot | Out-Null
 if (-not (Test-Path -LiteralPath (Join-Path $astrbotRoot '.astrbot') -PathType Leaf)) {
     Push-Location $astrbotRoot
     try {
-        & $astrbotCommand init --yes
+        & $venvPython -I -B -m astrbot.cli init --yes
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     finally { Pop-Location }
 }
 
 & (Join-Path $projectRoot 'install.ps1') -AstrBotRoot $astrbotRoot -Replace -ResultPath $ResultPath
-if ($LASTEXITCODE -ne 0) { throw "Bridge plugin setup failed ($LASTEXITCODE)." }
 Write-Output "AstrBot 4.29.4 and 搬运工V2 are ready under $astrbotRoot"
+# The PowerShell-only plugin installer throws on failure and leaves LASTEXITCODE unchanged.
+exit 0
